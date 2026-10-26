@@ -8,6 +8,7 @@ const { isMainForm, selectDefaultForm, ordersByHand } = require('./form-order.js
 const { AUTO_TAB_NAME, AUTO_SECTION_NAME, placementOf, resolvePlacement } = require('./form-subgrid-placement.js');
 const { PAGE_BINDINGS, pageBindingsProblem, statedPageBindings, statableBinding, bindingProblemText } = require('./page-bindings.js');
 const { nearestName } = require('./nearest-name.js');
+const { navigationHolds } = require('./app-navigation.js');
 
 // URL scheme allowlist for spec-supplied URLs that the built app will RENDER (iframe dashboard tiles,
 // sitemap URL subareas). Only http(s) is allowed — a `javascript:`, `data:`, `vbscript:`, or `file:`
@@ -858,6 +859,45 @@ const ENTITY_KEY_HINTS = Object.assign(Object.create(null), {
   localizedLabels: ' — write the LCID map on the label FIELD itself (e.g. "displayName": { "1033": "Baseline", "3082": "Línea base" }), not in a separate per-table block; see references/app-spec-schema.md → "Localized labels"',
 });
 
+// The keys of a table's `primaryAttribute`: exactly what the build reads from it — the name column's schema name and label for the
+// table's create, its number format (autoNumberFormat), its level (required) and its length (maxLength) — and what a download writes
+// (primaryColumnOptionFields). The same rule as ENTITY_KEYS one level down: any other key used to validate clean and be ignored, so a
+// `maxlength`, an `autonumberFormat` or a `requiredLevel` made the table without the length, the format or the level its author wrote.
+// Frozen, in the order the messages list them.
+const PRIMARY_ATTRIBUTE_KEYS = Object.freeze(['schemaName', 'displayName', 'autoNumberFormat', 'required', 'maxLength']);
+
+// What to write instead, for a key a near spelling cannot explain. Prototype-less for the reason ENTITY_KEY_HINTS is: the lookup key
+// comes from the spec. `type` is the one most likely to look harmless — the name column has no type to choose, so `"AutoNumber"` there
+// made a plain text name.
+const PRIMARY_ATTRIBUTE_KEY_HINTS = Object.assign(Object.create(null), {
+  requiredLevel: ' — the level is \'required\': true, "recommended" or false',
+  type: " — the primary name column is always a single line of text: leave 'type' out (for an auto-numbered name, give 'autoNumberFormat')",
+});
+
+// The findings for the keys of one table's `primaryAttribute`, each with `label` (how the caller names the table) in front: one per
+// unknown key, naming the key it most likely meant (a written hint first, then the shared single-edit matcher, which also settles a
+// casing slip such as `maxlength`) and the allowed keys. Nothing for a value that is not a plain object — the caller's
+// `primaryAttribute.schemaName` check already reports that, and `Object.keys('x')` would turn it into a bogus "unknown key '0'".
+// The ONE rule behind both gates — validateAppSpec and the provision-entities input validator — so that neither accepts what the other
+// refuses. Enumerating is guarded because the object comes from the caller, and a validator RETURNS problems rather than throw them.
+function primaryAttributeKeyProblems(primaryAttribute, label) {
+  if (!primaryAttribute || typeof primaryAttribute !== 'object' || Array.isArray(primaryAttribute)) return [];
+  let keys;
+  try {
+    keys = Object.keys(primaryAttribute);
+  } catch {
+    return [`${label}: primaryAttribute could not be inspected — enumerating its keys threw`];
+  }
+  const hintFor = (key) => {
+    if (PRIMARY_ATTRIBUTE_KEY_HINTS[key]) return PRIMARY_ATTRIBUTE_KEY_HINTS[key];
+    const near = nearestName(key, PRIMARY_ATTRIBUTE_KEYS.map((k) => k.toLowerCase()));
+    const meant = near && PRIMARY_ATTRIBUTE_KEYS.find((k) => k.toLowerCase() === near);
+    return meant ? ` — did you mean '${meant}'?` : '';
+  };
+  return keys.filter((key) => !PRIMARY_ATTRIBUTE_KEYS.includes(key))
+    .map((key) => `${label}: unknown key '${key}' on primaryAttribute${hintFor(key)} (allowed: ${PRIMARY_ATTRIBUTE_KEYS.join(', ')})`);
+}
+
 // The most characters a table's primary name column may be asked for. A single line of text elsewhere in a table takes up
 // to 4,000, but the name column of a table does not: asked for more than 850 in a table create that also carried other columns, the
 // platform refuses it — HTTP 400, "The maximum length of Primary attribute 'new_name' is 4000. The maximum allowed limit
@@ -1279,18 +1319,44 @@ function labelAliases(value) {
 // Returns the offending aliases so the error can name them, each flagged `hidden` when at least one
 // side is a LOCALIZED label — that is the case the author cannot see by reading the line, and the
 // only one severe enough to fail a spec that provisioned correctly before this rule existed.
+//
+// One localized shape is NOT hidden: two labels that are IDENTICAL — the same text in each of the
+// same languages, whether one language or several:
+//   [ { "1036": "Ouvert" }, { "1036": "Ouvert" } ]
+//   [ { "1033": "Abierto", "3082": "Abierto" }, { "1033": "Abierto", "3082": "Abierto" } ]
+// The two lines read alike, so this is the duplicate `["Ouvert", "Ouvert"]` is, in stated languages,
+// and it is reported the same way (a warning). It is what a download finds for two options a maker
+// labelled alike, which Dataverse allows: in one language other than the download's authoring one,
+// or — as Dataverse holds them, MEASURED — in two, because it fills the environment's base language
+// in with the same text when a label is created in another language only. Refusing it made the
+// download write the labels as plain strings, which a rebuild labels in another language, or leave
+// the column untyped, which a rebuild into a fresh environment makes a text column. A map beside a
+// plain string, or beside a map that differs from it in any language, still names two options in a
+// way the line does not show, and stays hidden.
+//
+// One clash per text: a label that holds one text in several languages names it once.
 function ambiguousChoiceAliases(options) {
+  const list = options || [];
   const seen = new Map(); // alias -> { index, localized }
   const clashes = [];
-  (options || []).forEach((label, i) => {
+  list.forEach((label, i) => {
     const localized = isLocalizedLabelMap(label);
-    for (const alias of labelAliases(label)) {
+    for (const alias of new Set(labelAliases(label))) {
       const prior = seen.get(alias);
-      if (prior && prior.index !== i) clashes.push({ alias, first: prior.index, second: i, hidden: localized || prior.localized });
+      if (prior && prior.index !== i) clashes.push({ alias, first: prior.index, second: i, hidden: (localized || prior.localized) && !identicalLocalizedLabels(label, list[prior.index]) });
       else if (!prior) seen.set(alias, { index: i, localized });
     }
   });
   return clashes;
+}
+
+// Are two labels the same LOCALIZED label: both maps, keyed by the same canonical LCIDs, with the same
+// text at each? A map with a key that is no canonical LCID is never the same (validateLabel refuses it).
+function identicalLocalizedLabels(a, b) {
+  if (!isLocalizedLabelMap(a) || !isLocalizedLabelMap(b)) return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length || localizedLabelLcids(a).length !== keys.length) return false;
+  return keys.every((k) => Object.prototype.hasOwnProperty.call(b, k) && a[k] === b[k]);
 }
 
 // Reject a LOCALIZED label on a global choice. AB#6686428.
@@ -2488,6 +2554,11 @@ function validateAppSpec(spec, opts = {}) {
   // structural profile (teardown, preview) takes it as a warning in the same words, and so does read-only verification, which keeps the
   // deploy profile and passes `fieldOptionKeys: 'warn'`, as it passes `columnValues: 'warn'`. Nothing else about the entry moves.
   const fieldOptionKeyFindings = profile === 'structural' || opts.fieldOptionKeys === 'warn' ? warnings : errors;
+  // Where an unknown key of a table's `primaryAttribute` goes (primaryAttributeKeyProblems), by the same arrangement as fieldOptions keys
+  // above: the build ignores such a key, so every profile that builds or plans a build keeps it an error, while a release before the check
+  // accepted and built a spec carrying one — so the structural profile and read-only verification (`primaryAttributeKeys: 'warn'`) take it
+  // as a warning in the same words.
+  const primaryAttributeKeyFindings = profile === 'structural' || opts.primaryAttributeKeys === 'warn' ? warnings : errors;
   if (!VALIDATION_PROFILES.includes(profile)) {
     return { ok: false, errors: [`unknown validation profile '${profile}' (valid: ${VALIDATION_PROFILES.join(', ')})`], warnings };
   }
@@ -2665,6 +2736,7 @@ function validateAppSpec(spec, opts = {}) {
     if (!e.primaryAttribute || !e.primaryAttribute.schemaName) {
       errors.push(`entity ${e.schemaName}: primaryAttribute.schemaName required`);
     }
+    primaryAttributeKeyFindings.push(...primaryAttributeKeyProblems(e.primaryAttribute, `entity ${e.schemaName}`));
     // The length of the table's name column, asked for when the table is created (an existing table's column is left as it
     // is).
     if (e.primaryAttribute && typeof e.primaryAttribute === 'object') {
@@ -2777,8 +2849,12 @@ function validateAppSpec(spec, opts = {}) {
       }
     }
   }
-  if (!entityNames.size) {
-    errors.push('at least one entity is required');
+  // A spec with no table is an app only when its navigation shows something else: generative pages, dashboards over tables
+  // the environment already has, or URLs. Such an app is real — `apps.js create --page-id` makes one, and the build makes one
+  // from a navigation of pages only by creating the pages first (app-navigation.js) — so a download of it must give a spec the
+  // build takes. Without a table AND without a navigation entry there is nothing to build an app from.
+  if (!entityNames.size && !navigationHolds(spec).entries) {
+    errors.push('at least one entity is required — or, for an app with no tables, an entry in appShell (a page, a dashboard or a URL)');
   }
   // Web resources (optional — JS/HTML/CSS shipped for form logic).
   const WEB_RESOURCE_KINDS = new Set(['js', 'html', 'css', 'xml', 'png', 'jpg', 'gif', 'xsl', 'ico', 'svg', 'resx']);
@@ -4107,8 +4183,11 @@ function validateAppSpec(spec, opts = {}) {
     if (typeof spec.design !== 'object' || spec.design === null || Array.isArray(spec.design)) {
       errors.push('design must be an object');
     } else {
-      const allowed = new Set(['accentColor', 'density', 'cornerRadius', 'darkMode', 'layout']);
+      const allowed = new Set(['accentColor', 'density', 'cornerRadius', 'darkMode', 'layout', 'style']);
       for (const k of Object.keys(spec.design)) if (!allowed.has(k)) errors.push(`design: unknown key '${k}' (allowed: ${[...allowed].join(', ')})`);
+      // `style` is the maker's own look in words (a screenshot read into colors and fonts, a website to match, a description), which the page plan
+      // carries as a `Maker-requested:` styling line that wins over the default look (lib/page-plan.js designPreferences). Text, or it says nothing.
+      if (spec.design.style !== undefined && (typeof spec.design.style !== 'string' || !spec.design.style.trim())) errors.push('design.style must be a non-empty string: the look the maker asked for, in words');
     }
   }
   // Security personas (optional; additive — validated on v1 and v2 specs). Each persona authors ONE
@@ -4574,6 +4653,8 @@ module.exports = {
   ENTITY_KEYS,
   invalidLanguageCodeMessage,
   ENTITY_KEY_HINTS,
+  PRIMARY_ATTRIBUTE_KEYS,
+  primaryAttributeKeyProblems,
   DIRECT_ENTRY_BEHAVIORS,
   COLUMN_VISUALIZATIONS,
   INTEGER_FORMATS,

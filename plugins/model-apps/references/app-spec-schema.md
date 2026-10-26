@@ -70,7 +70,10 @@ sample data (incl. multi-parent junction links + status reasons), and publish.
   (png/jpg/gif/svg/ico in `webResources[]`) so the app is **self-contained** on export/import.
   **Omit it** and the build generates a simple default SVG icon **inside the solution** — either
   way the app never depends on an arbitrary external/managed icon (which would fail to import into
-  a new environment). The app's **sitemap** is also added to the solution automatically.
+  a new environment). The app's **sitemap** is also added to the solution automatically, and so is every
+  **generative page** the build writes or keeps (a changed-only run asserts the pages it leaves as they are
+  too): the add of the app brings its sitemap but never the pages its
+  navigation opens, so each page is added on its own (a system solution such as `Default` holds them already).
   **The icon is set when the app is created, and a rebuild cannot change it** (the platform stores it once): when
   `app.icon` names a web resource that is not the icon the app has, the build warns that it was **not applied** —
   change it in the app designer, or point `app.icon` at the web resource the app already uses. A spec with no
@@ -307,11 +310,40 @@ An `entities[].localizedLabels` key is therefore **not** a supported shape.
 
 **Referencing a localized label.** Anywhere the spec names an artifact by its label — `sampleData`
 choosing a Choice option, or `personas[].jobs[].surfaces[]` naming a screen — **any** of its
-languages resolves to the same artifact. One option, one value, several names.
+languages resolves to the same artifact. One option, one value, several names. So one text must not
+name two options of a column: validation **refuses** it when you cannot see it on the line — one of the
+two is a label of several languages the other does not match in every language, or they are in different
+languages (`"Open"` beside `{ "3082": "Open" }`) — and **warns** when you can: two equal plain strings, or
+two identical localized labels, the same text in each of the same languages (`{ "1036": "Ouvert" }` twice,
+or `{ "1033": "Abierto", "3082": "Abierto" }` twice — how Dataverse holds two options labelled "Abierto" in
+Spanish on an English environment: it fills the base language in with the same text). Dataverse allows
+that duplicate; a reference to the text resolves to the first of the two.
 
 **Round-trip.** `download-model-app` reconstructs localized labels from Dataverse: a table, plural,
-column or option labelled in several languages comes back as a map, and one labelled in a single
-language comes back as a plain string (so no existing spec changes shape). The download emits
+column, lookup, alternate key or option labelled in several languages comes back as a map. One labelled
+in a single language comes back as a plain string when that language is the download's authoring
+language (`--language-code`, else the `languageCode` the spec already on disk pins, else the environment's
+base language — so no ordinary spec changes shape), and as a **one-entry map** when it is another:
+`{ "3082": "Pedido" }` for a table labelled only in Spanish, the base language of its environment,
+downloaded in English with `--language-code 1033`; `{ "1033": "Note" }` for an English-only column of an
+English environment downloaded with `--language-code 3082`. (Dataverse fills the base language in, with the
+same text, when a label is created in another language only, so the one language a label holds alone is the
+environment's base language.) A plain string is written in the language a rebuild resolves, so that label used to
+come back as an English label with Spanish text; a map keeps its language, and a rebuild into an
+environment that does not have it stops at the start of its data model and names it (see the rule above)
+instead. Every plain label in a downloaded spec is in the authoring language, as its navigation titles
+are: a rebuild into an environment whose base language is another writes them in that one, unless the
+spec pins `languageCode` or the build is given `--language-code`. Two Choice options a maker labelled with
+the same text keep their labels, and the column its type, when the two labels are identical in every language
+they hold (a duplicate validation warns about) — the way Dataverse holds them; when the text is in two
+languages — an English `"Open"` on one option, a Spanish `"Open"` on another — the spec can hold those two
+options only as plain strings, so they alone are written that way, and the download warns that their labels
+could not keep their language. A clash the spec cannot hold at all — two labels of several languages that
+differ in some language, so which option the text means depends on the language — leaves the column without
+a type, and the download's warning names the clash. A lookup that sets no
+label is labelled like the table it points at (see `lookup.displayName` below), so the download leaves a
+lookup's label out only when that label is the lookup's own, language for language: an English `"Contact"`
+on a lookup to a table labelled only in French `"Contact"` is written out. The download emits
 `pluralName` alongside a localized `displayName`, so its own output re-validates, and beside a plain one
 whenever it is not the `"<displayName>s"` a rebuild would derive — `"Tag Catalog"` for `"Tag"` comes back,
 `"Tags"` does not (it is the default).
@@ -363,7 +395,8 @@ maker typed in the UI**.
 reconstruct as rebuildable spec (`solution`, `entities[]`, `entities[].columns[]`, `dashboards[]`).
 Views, charts, forms, business rules and global choices are not fully reconstructed yet, so their
 deployed descriptions are exposed under `descriptionInventory` for inspection only rather than as
-partial rebuildable artifacts. Null or absent Dataverse descriptions are omitted, never written as
+partial rebuildable artifacts (the command-bar buttons of the app's tables are listed there too, by
+table and label). Null or absent Dataverse descriptions are omitted, never written as
 `""`.
 
 **Rebuild behaviour:** a description is written at CREATE, and is additionally **reconciled on an
@@ -400,6 +433,14 @@ difference and the next full build restores the spec's value (a `--changed-only`
 spec with its last snapshot, not with the deployed row, so it does not notice).
 
 ## entities[]
+
+**An app with no tables of its own** — one whose navigation holds only generative pages, dashboards over
+tables the environment already has, or URLs (an app made with `apps.js create --page-id` is one) — is a
+valid spec with `"entities": []`. The build makes it (a navigation of pages only is built pages first), and
+`download-model-app.js`, `--verify` and teardown take it as they take any other spec. A spec with no table
+**and** no navigation entry has nothing to build an app from, and is refused: `at least one entity is
+required`.
+
 ```jsonc
 {
   "schemaName": "new_ticket",            // publisher-prefixed; logical name is its lowercase
@@ -469,7 +510,10 @@ spec with its last snapshot, not with the deployed row, so it does not notice).
   plus `statusReasons` / `alternateKeys` / `mainFormOrder`. Anything else — a misspelled `pluralname`, or a
   `languageCode` / `localizedLabels` asking for a per-table language or a parallel label block —
   fails validation naming the alternative, rather than validating clean and being dropped from the
-  build.
+  build. **`primaryAttribute` takes exactly `schemaName`, `displayName`, `autoNumberFormat`, `required`
+  and `maxLength`** — the same rule one level down: a `maxlength`, `autonumberFormat`, `requiredLevel` or
+  `type` there is refused, naming the key it most likely meant (the name column is always text, so it has
+  no `type`).
 - **Column `type`:** `Text · Memo · Choice · MultiChoice · Boolean · Money · DateTime ·
   Integer · BigInt · Decimal · Double · File · Image · AutoNumber · Customer`.
   **Lookups are NOT columns** — declare a `OneToMany` relationship instead.
@@ -1619,8 +1663,10 @@ custom control), but the spec validator emits a warning.
   An unreadable proof or failed record write leaves the app intact. A retry uses those records even
   when `pages[]` is empty and the app has already gone. Proven pages still undeleted keep their records,
   manifest and solution and prevent a successful result. Only completed deletion or confirmed absence
-  consumes the records. Form-only references are not scanned; platform sitemap dependencies remain an
-  additional safeguard, not proof that no form embeds the page.
+  consumes the records. **Known limit:** a page a **form** still embeds (the `MscrmControls.UxAgentControl`
+  control, whose `RefId` holds the page id) is deleted anyway — the platform records no dependency for it, and
+  teardown reads no form — and the form is left pointing at a page that is gone. Take the page off such forms (or
+  delete them) before tearing the app down; the dry run lists every page it would delete.
 - **Workspace clearing preserves ownership.** `--clear-workspace` refuses while any unconsumed local
   ownership record remains, including other apps/environments. The refusal names each record file.
   Teardown consumes a record when it deletes or confirms the page's absence; a record whose page
@@ -1727,12 +1773,19 @@ custom control), but the spec validator emits a warning.
     only through a custom connector's definition (its `connector` row), which is the environment's own and can be
     another version than the page was made with; a reference whose custom connector lookup is absent, null or not a
     GUID — which a connector the platform publishes also has — is not proof of which connector defines them.
+  - **built-in operations** — an `actionBindings` entry named exactly `WhoAmI` or `RetrieveVersion` is a reviewed
+    built-in Dataverse Function, not a Custom API (`references/dataverse-operations.md`): it is left out of the
+    `customapi` read (a page that binds only them reads no `customapi` row), never called missing, and said as NOT
+    CHECKED — its availability in the environment or player and the signed-in user's permissions; one whose
+    declarations do not explicitly say "unbound Function, no inputs" draws a `dataverse-operation-shape` warning and
+    is written as the spec states it. A download names them under `pageBindings.neededInTarget.dataverseOperations`,
+    never under `customApis`: there is nothing to deploy. Any other spelling (`whoami`) is a Custom API name.
 
   `/app-builder` never authors these lists — it writes no connector or Custom API code — so they come from a page
   a download read. A page you reset to `source.kind: "intent"` to regenerate it is generated without connector
-  code: delete its bindings from the spec too, or it keeps bindings its code no longer uses. The `custom-api`
-  feature flag gates what the `/genpage` agents author, not the download or the rebuild of bindings a page
-  already holds.
+  code: delete its bindings from the spec too, or it keeps bindings its code no longer uses. The
+  `dataverse-operations` feature flag gates what the `/genpage` agents author, not the download or the rebuild
+  of bindings a page already holds.
 - **Safety HALTs (pages phase).** The build halts on identity/safety violations rather than
   proceeding with potentially wrong state:
   - `pages-identity-conflict` — spec `pageId` and manifest disagree on a key, or a duplicate id is
@@ -1868,6 +1921,15 @@ custom control), but the spec validator emits a warning.
 ```
 - Shared styling tokens threaded to every page so generated pages look consistent with each other
   and the model-driven shell (both Fluent UI V9). Unknown keys are rejected.
+- **`style`** *(optional)* — the maker's own look, in words, when they ask for one: a screenshot or
+  mockup read into colors and fonts, a website to match, or a description (`"navy #0b2545 primary,
+  gold #c9a227 accent, warm white #faf7f0 background, Georgia headings, 2px corners (from:
+  screenshot)"`). Give concrete values: hex colors with their roles, a font with a fallback, corner
+  radius, density. It wins over the default model-driven look: the page plan carries it as a
+  `Styling:` line that starts with `Maker-requested:`, and every page applies it
+  (`references/rules.md` → *Maker-requested styling*, which also says what a page cannot match).
+  Omit it to keep the default look. It must be a non-empty string. It is stored in the app's page
+  manifest with the rest of `design`, so a download keeps it.
 - During **generate-pages** the design contract is passed to each headless `page-builder` agent
   so all generated `.tsx` files apply the same Fluent UI V9 token set (accent color, density,
   corner radius, dark-mode policy). Run `node scripts/preview-app.js @<dir>/app-spec.json` to

@@ -14,6 +14,8 @@
 //   genpage.runtimeTypes(dataSources, options)  the RuntimeTypes text a page is authored against   -> a string
 //   genpage.defaultViews(tables)            the default public view of each table                  -> { views: [{ table, viewId }], warnings }
 //   genpage.baseLanguage()                  the environment's base language (an LCID)
+//   genpage.solutionTarget(uniqueName)      the solution a page is to join, read before the page is written -> { uniqueName, systemSolution, componentType? }
+//   genpage.addToSolution(pageId, target)   the page (and its file rows) into that solution                 -> { added }
 //   genpage.fileVersions(pageIds)           the versionnumber of every file row of each page, from one plain read -> { ok, versions: Map<pageId, Map<fileRowId, version> | null>, error }
 //   genpage.projectVersions(pageIds)        the versionnumber of each page's own row, from one plain read          -> { ok, versions: Map<pageId, version | null>, error }
 //   genpage.publishedDiffers(pageId, args, expected)  what a page's PUBLISHED copy differs from `args` (and its compiled output from `expected.runtimeSha256`) in, read back with plain reads -> { ok, differing: [field…], fingerprint, error }
@@ -45,6 +47,8 @@ const { sha256 } = require('./hash.js');
 const { withCause } = require('./retry-policy.js');
 const { makeThrottleBudget, waitDoesNotFit, spentNote } = require('./throttle-budget.js');
 const { mergeBindings } = require('./page-bindings.js');
+const { isRestrictedSolution } = require('./system-solutions.js');
+const { readTargetSolution, readPageComponentType, pageComponent } = require('./page-solution.js');
 
 const GUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -99,6 +103,7 @@ const messageOf = (error) => String((error && error.message) || error);
 // (`…(LogicalName='account')/Attributes/…`), from another path, or for a table nobody asked for (one a lookup column points at) is something else — a column read that raced a change, a proxy, a table the caller
 // cannot see — and is left as the SDK's own error, as is any other status.
 // See: https://learn.microsoft.com/en-us/power-apps/developer/data-platform/webapi/query-metadata-web-api (a table's definition is read at EntityDefinitions(LogicalName='…'))
+// The lookup discovery (lib/lookup-metadata.js) tells a missing table with it too: GENPAGE_TABLE_NOT_FOUND here, LOOKUP_TABLE_NOT_FOUND there.
 function missingTableOf(error, askedFor) {
   if (!error || error.statusCode !== 404 || typeof error.url !== 'string') return null;
   const named = /\/EntityDefinitions\(LogicalName='([A-Za-z0-9_]+)'\)(?:\?|$)/.exec(error.url);
@@ -1613,6 +1618,32 @@ function makeGenpageSdk(env, deps = {}) {
       return (await (await getSdk()).getEnvironmentLanguages()).baseLanguage;
     },
 
+    // The solution a page is to join (`genpage-upload.js --solution`), read BEFORE the page is written, so a name that is no unmanaged solution — or a page table whose
+    // component type the environment cannot say — refuses the upload with nothing made (lib/page-solution.js: why a page is added explicitly, and how).
+    //   -> { uniqueName, systemSolution: true }                    a system solution (Default, Active, Basic): it holds every component already, so nothing is read and nothing will be added
+    //   -> { uniqueName, systemSolution: false, componentType }    the unmanaged solution, as the platform spells its name, and the page table's component type
+    // It throws, with a code: SOLUTION_NOT_FOUND, SOLUTION_MANAGED, GENPAGE_COMPONENT_TYPE_UNRESOLVED, or the SDK's own for a read that failed.
+    async solutionTarget(uniqueName) {
+      const name = String(uniqueName === undefined || uniqueName === null ? '' : uniqueName).trim();
+      if (!name) throw genpageError('a solution is named by its unique name, and none was given', { code: 'SOLUTION_NOT_FOUND', outcome: 'nothing' });
+      if (isRestrictedSolution(name)) return { uniqueName: name, systemSolution: true };
+      const sdk = await getSdk();
+      const solution = await readTargetSolution(sdk, name);
+      return { uniqueName: solution.uniqueName, systemSolution: false, componentType: await readPageComponentType(sdk.dataverse) };
+    },
+
+    // Adds the page to the solution `target` names (solutionTarget's answer): the page's own row, and with it its file rows (AddRequiredComponents). A system solution
+    // is not added to. A component the solution holds already is accepted by the platform, so adding a page twice changes nothing. -> { added: true | false }
+    async addToSolution(pageId, target) {
+      const id = guidOf(pageId, 'page');
+      if (!target || target.systemSolution) return { added: false };
+      if (!Number.isInteger(target.componentType) || target.componentType <= 0) {
+        throw genpageError(`page ${id} cannot be added to solution ${target.uniqueName}: the page table's component type is not known`, { code: 'GENPAGE_COMPONENT_TYPE_UNRESOLVED', outcome: 'nothing', pageId: id });
+      }
+      await (await getSdk()).addSolutionComponent(pageComponent(id, target.componentType, target.uniqueName));
+      return { added: true };
+    },
+
     // The versionnumber of EVERY file row of each page — what the build's publish record compares (lib/page-publish-records.js has the measured facts and why this read is the plain one). A page is a
     // `uxagentprojects` row and its `uxagentprojectfiles` rows; one plain query per PAGE_VERSION_CHUNK pages, followed to its last page:
     //   GET /uxagentprojectfiles?$select=uxagentprojectfileid,versionnumber,_uxagentprojectid_value&$filter=_uxagentprojectid_value eq <id> or _uxagentprojectid_value eq <id>
@@ -1808,7 +1839,7 @@ function makeGenpageSdk(env, deps = {}) {
   // The operations are counted while they run: what release() waits for on an SDK it does not own. A closed backend refuses them in getSdk,
   // which the two listings reach inside their own try — a listing never rejects (a listing that cannot be read is `{ ok: false, error }`, and a
   // caller decides between creating a page and reusing one on that), so on a closed backend it answers exactly that.
-  for (const name of ['enumerateEnv', 'enumeratePages', 'read', 'create', 'update', 'placeInApp', 'removeFromApp', 'describe', 'delete', 'runtimeTypes', 'defaultViews', 'baseLanguage', 'fileVersions', 'projectVersions', 'publishedDiffers']) {
+  for (const name of ['enumerateEnv', 'enumeratePages', 'read', 'create', 'update', 'placeInApp', 'removeFromApp', 'describe', 'delete', 'runtimeTypes', 'defaultViews', 'baseLanguage', 'solutionTarget', 'addToSolution', 'fileVersions', 'projectVersions', 'publishedDiffers']) {
     const operation = api[name];
     api[name] = (...args) => {
       const run = operation(...args);
@@ -1902,4 +1933,5 @@ async function appsNaming(sdk, pageId) {
 module.exports = {
   makeGenpageSdk, unescapePacName, suppliedButBlank, sourceText, dataSourcesOf, promptTranscript, configJson, pageFolderFiles,
   genPagesOfSiteMap, entityTablesOfSiteMap, writeOutcome, PRE_WRITE_REFUSALS, genpageError, holdsWhatWasSent, describeDivergence, contentFingerprint, watchThrottles, GUID_RE,
+  missingTableOf,
 };

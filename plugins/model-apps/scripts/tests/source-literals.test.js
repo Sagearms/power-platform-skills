@@ -12,6 +12,9 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const { blankLiterals, blankNonCodePreservingTemplateExpressions, commentRanges, endsMidStatement, findElisionMarker, hasDefaultExport, hasUnbalancedBrackets, scanTemplateExpressionEnd, expressionPosition, opensTypeParameters, elementFailsAt, elementChildren, isTrivia, isSingleLineTrivia, trimTrivia, TRIVIA_CLASS, WS, AMBIGUITY_KINDS, ANGLE_AFTER, ANGLE_AFTER_LINE_BREAK, NO_MEMBER_BEFORE, RESERVED_WORDS, TYPE_PARAMETER_MODIFIERS, MEMBER_NAME_OPERATORS } = require('../lib/source-literals.js');
 const { navReferencedKeys, strayPageRefs, resolvePageRefs } = require('../lib/pageref-resolver.js');
 const { pageStructureProblems } = require('../lib/page-structure.js');
+// These tests hold the lexer to its own rules — what it reads for certain, what it reports as a guess, and what a guess costs a page — so they read pages with
+// the lexer alone. Where the lexer guesses, the gates ask the TypeScript parser (typescript-views.js), which parser-check.test.js tests.
+require('../lib/typescript-views.js').setParserCheck(false);
 
 const { loadTypescriptOracle, loadBabelOracle } = require('./helpers/typescript-oracle.js');
 const { FRAMES, tokenVocabulary, programsFor, cleanSourceFile, readingAt, isElement, SIGNATURE_ENDINGS, HIDING_ENDINGS, CERTAIN_ELEMENTS, GUESSED_ELEMENTS, HIDDEN_TEXT_ELEMENTS, UNREAD_LIST_ELEMENTS, MEMBER_ELEMENT_FRAMES, NO_MEMBER_ELEMENT_FRAMES, signaturePages, elementPages, SIGNATURE_FRAMES, DECOYS, signaturePage, EXACT_DEFAULTS, UNREAD_DEFAULTS, UNTERMINATED_DEFAULTS, PROSE_SHAPED_LINES, PROSE_OPEN_LINES, PROSE_HIDING_ELEMENTS, proseElements, PARAMETER_MODIFIERS } = require('./helpers/angle-frames.js');
@@ -744,53 +747,435 @@ test('hasDefaultExport reads a generic arrow\'s return type to its end, and want
   }
 });
 
-// A known limit, pinned as it is: a default value in a binding pattern of a function type's parameter is passed over to the next `,` or closing bracket at its own level,
-// and the comma between a generic call's type arguments (`f<T, U>()`) is taken for one. The pattern then reads as none, the parentheses as a parenthesised type, and the
-// function type's own `=>` as the arrow, so a write cut right after such a function type — no arrow, no body — is accepted here. The page compile refuses it (TypeScript:
-// `'=>' expected`). The page it was cut from is accepted, as it should be.
-test('known limit: a generic call with two type arguments in a default value of a function type\'s parameter', () => {
-  assert.equal(hasDefaultExport('export default <T,>(p: T): ({ a = f<T,T>() }) => T'), true, 'the cut is accepted: the known limit');
-  assert.equal(hasDefaultExport('export default <T,>(p: T): ({ a = f<T,T>() }) => T => null as never;\n'), true);
-  // With the call in parentheses the default value is passed over whole, the pattern is read, and the cut is refused.
+// A default value in a binding pattern of a function type's parameter is read as TypeScript reads it, a generic call's type arguments included: the comma between them
+// (`f<T, U>()`) is the call's, so the pattern is read, the parentheses hold the function type's parameters, its `=>` is its own, and a write cut right after that
+// function type — no arrow, no body — is refused, as the page compile refuses it (TypeScript: `'=>' expected`). The type arguments are read strictly, each to its end
+// with what its groups hold; where TypeScript reads a comparison instead (no list of types between `<` and `>`, or a `>` that nothing can follow), the value ends at its
+// first comma, as JavaScript reads it. [what, default value]
+const GENERIC_CALL_DEFAULTS = [
+  ['a generic call', 'f<T,T>()'],
+  ['a generic call with a space after the comma', 'f<T, U>()'],
+  ['an instantiation expression', 'f<T, U>'],
+  ['a tagged template with type arguments', 'f<T, U>`t`'],
+  ['a call whose parenthesis is on the next line', 'f<T, U>\n(x)'],
+  ['a trailing comma in the type arguments', 'f<T,>()'],
+  ['nested type arguments', 'f<A<B<C>>, D>()'],
+  ['a union, an array, literal types and a conditional type', 'f<T | U, V[], "a", -1, T extends U ? X : Y>()'],
+  ['a tuple, an indexed access, a parenthesised type and a type query', 'f<[T, U], T[K], (T), typeof a.b>()'],
+  ['`keyof`, `readonly` and an empty object type', 'f<keyof T, readonly U[], {}>()'],
+  ['what JavaScript reads as two comparisons', 'x < y, z > (w)'],
+  ['type arguments after a call, a parenthesised callee, a string and a property named `in`', 'g()<T, U>() + (f)<T, U>() + "s"<T, U>() + a.in<T, U>()'],
+];
+// [what, default value]: no list of types, so TypeScript reads a comparison, the value ends at the first comma and the next element is another binding — the pattern is
+// read either way, and the parentheses hold the function type's parameters.
+const COMPARISON_DEFAULTS = [
+  ['a sum between the angle brackets', 'x < y + 1, z = q > (w)'],
+  ['a comparison and a default after it', 'x < y, z = q > w'],
+];
+// [what, default value]: a list of types that what follows cannot follow — a name, a sign, a bracket, a `!` — is a comparison to TypeScript
+// (canFollowTypeArgumentsInExpression), so `> w` is part of a binding, which no binding is: the braces make no pattern, and TypeScript refuses them as a type as well.
+const COMPARISON_REFUSALS = [
+  ['a name after the list', 'x < y, z > w'], ['a name after a generic name', 'f<T, U> w'], ['a sign after the list', 'f<T, U> -1'], ['a plus after the list', 'f<T, U> + 1'],
+  ['a bracket after the list', 'f<T, U> [0]'], ['a brace after the list', 'f<T, U> {}'], ['a negation after the list', 'f<T, U> !x'],
+];
+// [what, default value]: a type argument that the strict reading does not read — a function type, an object type with members — leaves the value read to its first comma, as
+// before: the pattern then reads as none, and a write cut right after such a function type is still accepted (the page compile refuses it; AGENTS.md, "TSX source lexer —
+// known limits").
+const UNREAD_GENERIC_CALL_DEFAULTS = [
+  ['a function type for a type argument', 'f<(x: T) => U, V>()'],
+  ['an object type with a member for a type argument', 'f<{ a: T }, U>()'],
+];
+// [what, default value]: values that TypeScript's parser or Babel's refuses in a parameter although the lexer cannot see why — a legacy octal number (TypeScript), a word
+// strict code reserves (Babel) — with a generic call's type arguments before or around them. The page that only the function type's reading accepts, `({ a = V }: R) =>
+// | X | null => …`, stays refused as it was: reading the type arguments only ever refuses more (genericArrowIsComplete).
+const REFUSED_VALUE_DEFAULTS = [
+  ['a legacy octal number in the call', 'f<T, U>(010)'], ['`await` before the call', 'await f<T, U>()'], ['`let` in the call', 'f<T, U>(let)'],
+  ['`yield` in the call', 'f<T, U>(yield)'], ['`await` after the call', 'f<T, U>() + await x'],
+];
+
+test('a generic call\'s type arguments in a default value of a function type\'s parameter are read as TypeScript reads them', () => {
+  const ts = loadTypescriptOracle();
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const pages = (value) => ({
+    cuts: [
+      `export default <T,>(p: T): ({ a = ${value} }) => T`,
+      `export default <T,>(p: T): ({ a = ${value}, b }) => T`,
+      `export default async <T,>(p: T): ([a = ${value}]) => T`,
+    ],
+    complete: [
+      `export default <T,>(p: T): ({ a = ${value} }) => T => null as never;\n`,
+      `export default async <T,>(p: T): ([a = ${value}]) => T => null as never;\n`,
+      // The function type's return type starts with a `|`, which begins no body: only the function type's reading takes it.
+      `export default <T,>(p: T): ({ a = ${value} }: R) => | X | null => () => null;\n`,
+    ],
+  });
+  for (const [what, value] of [...GENERIC_CALL_DEFAULTS, ...COMPARISON_DEFAULTS]) {
+    const { cuts, complete } = pages(value);
+    for (const code of cuts) {
+      assert.equal(hasDefaultExport(code), false, `${what}: the cut is refused: ${JSON.stringify(code)}`);
+      if (ts) assert.equal(parses(code), false, `TypeScript refuses ${JSON.stringify(code)}`);
+    }
+    for (const code of complete.slice(0, 2)) {
+      assert.equal(hasDefaultExport(code), true, `${what}: ${JSON.stringify(code)}`);
+      assert.deepStrictEqual(pageStructureProblems(code), [], what);
+      if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+    }
+    // Known limit, pinned: the page only the function type's reading accepts is accepted where the value reads the same to its first comma (a comparison: no type
+    // arguments are passed over), and refused where the type arguments had to be passed over to read it — as it was before they were read — although TypeScript parses it.
+    const comparison = COMPARISON_DEFAULTS.some(([name]) => name === what);
+    assert.equal(hasDefaultExport(complete[2]), comparison, `${what}: ${JSON.stringify(complete[2])}`);
+    if (ts) assert.equal(parses(complete[2]), true, `TypeScript parses ${JSON.stringify(complete[2])}`);
+  }
+  // A value TypeScript or Babel refuses in a parameter: every cut is still refused, the page that only the function type's reading accepts stays refused, and one of the
+  // two parsers refuses it too.
+  for (const [what, value] of REFUSED_VALUE_DEFAULTS) {
+    const { cuts, complete } = pages(value);
+    for (const code of cuts) assert.equal(hasDefaultExport(code), false, `${what}: the cut is refused: ${JSON.stringify(code)}`);
+    assert.equal(hasDefaultExport(complete[2]), false, `${what}: ${JSON.stringify(complete[2])}`);
+    if (ts && babel) assert.ok(!parses(complete[2]) || !babelParses(complete[2]), `TypeScript or Babel refuses ${JSON.stringify(complete[2])}`);
+  }
+  // With the call in parentheses the default value is passed over whole, as it always was.
   assert.equal(hasDefaultExport('export default <T,>(p: T): ({ a = (f<T,T>()) }) => T'), false);
   assert.equal(hasDefaultExport('export default <T,>(p: T): ({ a = (f<T,T>()) }) => T => null as never;\n'), true);
+  // No pattern, so no function type takes the `=>`: the `|` after it begins no body.
+  for (const [what, value] of COMPARISON_REFUSALS) {
+    const code = pages(value).complete[2];
+    assert.equal(hasDefaultExport(code), false, `${what}: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(code), false, `TypeScript refuses ${JSON.stringify(code)}`);
+  }
+  // Known limit, pinned: a type argument the strict reading does not read.
+  for (const [what, value] of UNREAD_GENERIC_CALL_DEFAULTS) {
+    const { cuts, complete } = pages(value);
+    assert.equal(hasDefaultExport(cuts[0]), true, `${what}: the cut is accepted, a known limit`);
+    for (const code of complete.slice(0, 2)) assert.equal(hasDefaultExport(code), true, `${what}: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(cuts[0]), false, `TypeScript refuses ${JSON.stringify(cuts[0])}`);
+  }
 });
 
-// Known limits, pinned as they are: two rare return types that TypeScript parses and the gate refuses (2.18.0 refused every synchronous generic-arrow default
-// export, and admitted the async forms of both, which are now refused too). A binding
-// pattern's computed key is read as an expression only as far as telling an index signature's or a mapped type's key from one needs, and any group in parentheses counts
-// as an operand: `K in (keyof T)` reads as an expression, so `({ [K in (keyof T)]: boolean })` reads as a function type's parameters, which take the arrow. And a key the
-// reading does not know — one that starts with a regular expression — is taken for no expression: the parentheses around a function type's parameters then read as a
-// parenthesised type, the function type's `=>` as the arrow, and a leading `|` of its own return type as no body. The workarounds (AGENTS.md, "TSX source lexer — known
-// limits") are accepted.
-test('known limits: a mapped type with its key type in parentheses, and a computed key the reading does not know', () => {
-  const refused = [];
-  for (const key of ['(keyof T)', '((keyof T))', '(keyof T) as K', '(T extends object ? keyof T : never)']) {
-    for (const modifier of ['', 'async ']) refused.push(`export default ${modifier}<T extends object>(p: T): ({ [K in ${key}]: boolean }) => null as never;\n`);
+// Known limit, pinned as it is (AGENTS.md, "TSX source lexer — known limits"): a mapped type whose key type is in parentheses (or brackets) and whose member type is a
+// name, inside a parenthesised return type, is refused although TypeScript and Babel parse it, sync and async — a fail-closed reading, kept on purpose. Both parsers
+// try the braces as a binding pattern first, whose computed key `[K in (keyof T)]` is an expression to them, and `(keyof T)` — two names side by side in
+// parentheses — is none: the pattern fails, and the parentheses hold a type. The gate takes any group in a computed key for an operand, so `K in (keyof T)` reads as an
+// expression, the braces as a binding pattern, the parentheses as a function type's parameters and the arrow as that function type's: the page reads as cut off.
+// Reading such braces as a mapped type would make the gate accept a page on the strength of every token in the key and member types, which it does not check as the
+// parsers do (an escaped keyword, a legacy octal number, a string escape): a reading that tried accepted pages TypeScript or Babel refuses. [what, mapped type]
+const PARENTHESISED_MAPPED_TYPES = [
+  ['a key type in parentheses', '{ [K in (keyof T)]: boolean }'],
+  ['a key type in two pairs of parentheses', '{ [K in ((keyof T))]: boolean }'],
+  ['a key type in parentheses, remapped', '{ [K in (keyof T) as K]: boolean }'],
+  ['a parenthesised conditional key type', '{ [K in (T extends object ? keyof T : never)]: boolean }'],
+  ['a key type in a tuple', '{ [K in [keyof T]]: boolean }'],
+  ['a key type in parentheses and a union', '{ [K in (keyof T) | "extra"]: boolean }'],
+  ['an object type with a member for the key type', '{ [K in ({ a: keyof T })]: boolean }'],
+  ['a constructor type for the key type', '{ [K in (new () => T)]: boolean }'],
+];
+// [what, mapped type]: the same key types where the braces make no binding pattern for another reason — an index with no argument after the group, a `?`, a modifier,
+// no member type, a `;`, a member type that is no name — hold a mapped type, as TypeScript reads them.
+const PARENTHESISED_MAPPED_TYPES_READ = [
+  ['an array of a parenthesised key type', '{ [K in (keyof T)[]]: boolean }'],
+  ['an optional mapped type', '{ [K in (keyof T)]?: T[K] }'],
+  ['`readonly` and `?`', '{ readonly [K in (keyof T)]?: T[K] }'],
+  ['`-readonly` and `-?`', '{ -readonly [K in (keyof T)]-?: T[K] }'],
+  ['`+readonly` and `+?`', '{ +readonly [K in (keyof T)]+?: T[K] }'],
+  ['no type for the members', '{ [K in (keyof T)] }'],
+  ['a semicolon after the member', '{ [K in (keyof T)]: boolean; }'],
+  ['an indexed access for the member type', '{ [K in (keyof T)]: T[K] }'],
+];
+// [what, page]: the rewrites the limit names — the key type without its parentheses, no parentheses around the return type, a type alias.
+const PARENTHESISED_MAPPED_TYPE_REWRITES = [
+  ['the key type without its parentheses', 'export default <T extends object>(p: T): ({ [K in keyof T]: boolean }) => null as never;\n'],
+  ['the key type without its parentheses, async', 'export default async <T extends object>(p: T): ({ [K in keyof T]: boolean }) => null as never;\n'],
+  ['no parentheses around the return type', 'export default <T extends object>(p: T): { [K in (keyof T)]: boolean } => null as never;\n'],
+  ['a type alias', 'type Flags<T> = { [K in (keyof T)]: boolean };\nexport default <T extends object>(p: T): Flags<T> => null as never;\n'],
+];
+// [what, return type, then what follows it]: TypeScript reads each of these one way, which the gate reads too.
+const MAPPED_KEY_NEIGHBOURS = [
+  // A key type that is an expression too: `K in (T)` is one, and so is `K in (Extract<keyof T, string>)` — an instantiation expression, whose type arguments TypeScript
+  // reads as types (parseTypeArgumentsInExpression) — so the braces are a binding pattern and the arrow is the function type's.
+  ['an expression in parentheses', '({ [K in (T)]: boolean })', false],
+  ['an instantiation expression in parentheses', '({ [K in (Extract<keyof T, string>)]: boolean })', false],
+  // No `K in`: the key is no expression and no mapped type's, and TypeScript refuses the braces either way.
+  ['a parenthesised key type with no name', '({ [(keyof T)]: boolean })', false],
+  ['a key type that is no type', '({ [K in (keyof T foo)]: boolean })', false],
+  // A parenthesised type holds one type: a `,` after the mapped type is an error, and so is a `,` that ends its member (parseSemicolon wants a `;`).
+  ['a second parameter after the braces', '({ [K in (keyof T)]: boolean }, b)', false],
+  ['a comma after the member', '({ [K in (keyof T)]: boolean, })', false],
+  ['the key type without parentheses', '({ [K in keyof T]: boolean })', true],
+  ['the return type without parentheses', '{ [K in (keyof T)]: boolean }', true],
+  // A `;` and a member after the mapped one make no binding pattern: the parentheses hold a type, which TypeScript parses
+  // (only its checker refuses a member beside a mapped one).
+  ['a member after the mapped one', '({ [K in (keyof T)]: boolean; b: string })', true],
+];
+
+test('known limit: a mapped type whose key type is in parentheses, inside a parenthesised return type, is refused although TypeScript parses it', () => {
+  const ts = loadTypescriptOracle();
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const [what, mapped] of PARENTHESISED_MAPPED_TYPES) {
+    for (const modifier of ['', 'async ']) {
+      const code = `export default ${modifier}<T extends object>(p: T): (${mapped}) => null as never;\n`;
+      assert.equal(hasDefaultExport(code), false, `${what}: refused, a known limit: ${JSON.stringify(code)}`);
+      assert.match(pageStructureProblems(code).join('\n'), /no complete default export/, what);
+      if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+      if (babel) assert.equal(babelParses(code), true, `Babel parses ${JSON.stringify(code)}`);
+      // The other half of the same reading: the page that only a function type's reading takes is accepted, and TypeScript refuses it (so does the page compile).
+      const asFunctionType = `export default ${modifier}<T extends object>(p: T): (${mapped}) => | T | null => () => null;\n`;
+      assert.equal(hasDefaultExport(asFunctionType), true, `${what}: ${JSON.stringify(asFunctionType)}`);
+      if (ts) assert.equal(parses(asFunctionType), false, `TypeScript refuses ${JSON.stringify(asFunctionType)}`);
+    }
   }
-  const regexKey = '<T,>(p: T): ({ [/key/.source]: value }: Record<string, T>) =>';
-  refused.push(`export default ${regexKey} | typeof value | null => () => null;\n`, `export default async ${regexKey} | typeof value | null => () => null;\n`);
-  for (const code of refused) assert.equal(hasDefaultExport(code), false, `refused, a known limit: ${JSON.stringify(code)}`);
-  // The workarounds: no parentheses around the key's type, none around the return type, a type alias; no leading `|`, a key written as a string. And an arrow
-  // without type parameters keeps its reading.
+  // The page cut right after such a return type reads the same way, and is refused.
+  assert.equal(hasDefaultExport('export default <T extends object>(p: T): ({ [K in (keyof T)]: boolean }) => T'), false);
+  for (const [what, mapped] of PARENTHESISED_MAPPED_TYPES_READ) {
+    for (const modifier of ['', 'async ']) {
+      const code = `export default ${modifier}<T extends object>(p: T): (${mapped}) => null as never;\n`;
+      assert.equal(hasDefaultExport(code), true, `${what}: ${JSON.stringify(code)}`);
+      assert.deepStrictEqual(pageStructureProblems(code), [], what);
+      if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+    }
+  }
+  for (const [what, code] of PARENTHESISED_MAPPED_TYPE_REWRITES) {
+    assert.deepStrictEqual(pageStructureProblems(code), [], `${what}: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+    if (babel) assert.equal(babelParses(code), true, `Babel parses ${JSON.stringify(code)}`);
+  }
+  for (const [what, returnType, expected] of MAPPED_KEY_NEIGHBOURS) {
+    const code = `export default <T extends object>(p: T): ${returnType} => null as never;\n`;
+    assert.equal(hasDefaultExport(code), expected, `${what}: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(code), expected, `TypeScript reads ${JSON.stringify(code)} the same`);
+  }
+});
+
+// Known limit, pinned as it is (AGENTS.md, "TSX source lexer — known limits"): a computed key that starts with a regular expression is taken for no expression, although
+// TypeScript and Babel read one — a fail-closed reading, kept on purpose. A function type whose parameter has such a key reads as a parenthesised type, its `=>` as the
+// arrow and a leading `|` of its own return type as no body, so the page is refused although both parsers parse it, sync and async; by the same reading a write cut
+// right after such a function type is accepted (TypeScript refuses it, and so does the page compile). Reading the key as an expression would accept such a page
+// whatever its regular expression's flags are, and Babel refuses an unknown, repeated or clashing flag that TypeScript's parser takes (its checker refuses it).
+// [what, page]
+const REGEX_KEY_PAGES = [
+  ['a computed key that starts with a regular expression', 'export default <T,>(p: T): ({ [/key/.source]: value }: Record<string, T>) => | typeof value | null => () => null;\n'],
+  ['the same, async', 'export default async <T,>(p: T): ({ [/key/.source]: value }: Record<string, T>) => | typeof value | null => () => null;\n'],
+  ['a regular expression with flags and an index', 'export default <T,>(p: T): ({ [/k/gi[0]]: value }: Record<string, T>) => | T | null => () => null;\n'],
+];
+// [what, flags]: flags Babel refuses and TypeScript's parser takes.
+const REGEX_KEY_BAD_FLAGS = [['an unknown flag', 'x'], ['a repeated flag', 'gg'], ['`u` with `v`', 'uv'], ['an upper-case flag', 'G'], ['a letter beyond ASCII', 'ü']];
+
+test('known limit: a computed key that starts with a regular expression is no expression to the gate, whatever its flags', () => {
+  const ts = loadTypescriptOracle();
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const [what, code] of REGEX_KEY_PAGES) {
+    assert.equal(hasDefaultExport(code), false, `${what}: refused, a known limit: ${JSON.stringify(code)}`);
+    assert.match(pageStructureProblems(code).join('\n'), /no complete default export/, what);
+    if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+    if (babel) assert.equal(babelParses(code), true, `Babel parses ${JSON.stringify(code)}`);
+  }
+  for (const [what, flags] of REGEX_KEY_BAD_FLAGS) {
+    const code = `export default <T,>(p: T): ({ [/k/${flags}.source]: v }: R) => | T | null => () => null;\n`;
+    assert.equal(hasDefaultExport(code), false, `${what}: refused: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(code), true, `TypeScript's parser takes ${JSON.stringify(code)}`);
+    if (babel) assert.equal(babelParses(code), false, `Babel refuses ${JSON.stringify(code)}`);
+  }
+  // By the same reading a page cut right after such a function type, or whose arrow the function type takes, is accepted, as it always was; TypeScript refuses it.
+  for (const code of ['export default <T,>(p: T): ({ [/k/]: v }) => T', 'export default <T,>(p: T): ({ [/k/]: v }) => p;\n', 'export default <T,>(p: T): ({ [K in /k/]: v }) => p;\n']) {
+    assert.equal(hasDefaultExport(code), true, `accepted, a known limit: ${JSON.stringify(code)}`);
+    if (ts) assert.equal(parses(code), false, `TypeScript refuses ${JSON.stringify(code)}`);
+  }
+  // The rewrites: no leading `|`, the key written as a string, a type alias for the function type; and an arrow without type parameters keeps its reading.
   for (const code of [
-    'export default <T extends object>(p: T): ({ [K in keyof T]: boolean }) => null as never;\n',
-    'export default <T extends object>(p: T): { [K in (keyof T)]: boolean } => null as never;\n',
-    'type Flags<T> = { [K in (keyof T)]: boolean };\nexport default <T extends object>(p: T): Flags<T> => null as never;\n',
-    `export default ${regexKey} typeof value | null => () => null;\n`,
+    'export default <T,>(p: T): ({ [/key/.source]: value }: Record<string, T>) => typeof value | null => () => null;\n',
     'export default <T,>(p: T): ({ ["key"]: value }: Record<string, T>) => | typeof value | null => () => null;\n',
     'type Pick1<T> = (pair: Record<string, T>) => | T | null;\nexport default <T,>(p: T): Pick1<T> => () => null;\n',
     'export default (p: T): ({ [/key/.source]: value }: Record<string, T>) => | typeof value | null => () => null;\n',
-  ]) assert.deepStrictEqual(pageStructureProblems(code), [], code);
+  ]) {
+    assert.deepStrictEqual(pageStructureProblems(code), [], code);
+    if (ts) assert.equal(parses(code), true, `TypeScript parses ${JSON.stringify(code)}`);
+  }
   // A group that holds an expression is one, as TypeScript reads it: these are function types that take the arrow, refused here and by TypeScript.
-  const grouped = ['(a + b)', 'keyof(T)'].map((key) => `export default <T,>(p: T): ({ [${key}]: v }) => p;\n`);
-  for (const code of grouped) assert.equal(hasDefaultExport(code), false, code);
-  // With the TypeScript parser oracle set: TypeScript parses every page refused above — a known limit, not a cut — and none of the grouped expressions.
+  for (const code of ['(a + b)', 'keyof(T)'].map((key) => `export default <T,>(p: T): ({ [${key}]: v }) => p;\n`)) {
+    assert.equal(hasDefaultExport(code), false, code);
+    if (ts) assert.equal(parses(code), false, `TypeScript refuses ${JSON.stringify(code)}`);
+  }
+});
+
+// With the TypeScript parser oracle set (and Babel's, where set): across the key types a page writes — each in no, one and two pairs of parentheses, in a tuple, in an
+// array and in a union — and the shapes of a mapped type (modifiers, `?`, `as`, no type, a `;`), the gate accepts no page either parser refuses, and the pages
+// TypeScript parses that it refuses are the known limit above: a key type in a group, whose braces read as a binding pattern.
+test('mapped types in a parenthesised return type: the gate accepts no page TypeScript refuses, and refuses one it parses only where the key type is in a group', (t) => {
   const ts = loadTypescriptOracle();
-  if (!ts) return;
-  const diagnostics = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length;
-  for (const code of refused) assert.strictEqual(diagnostics(code), 0, `TypeScript parses ${JSON.stringify(code)}`);
-  for (const code of grouped) assert.ok(diagnostics(code) > 0, `TypeScript refuses ${JSON.stringify(code)}`);
+  if (!ts) { t.skip('TYPESCRIPT_ORACLE_PATH is not set'); return; }
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const types = ['keyof T', 'T', 'T | U', 'keyof T & string', 'T[number]', 'T[]', '"a" | "b"', '-1', 'typeof x', 'A.B<C>', 'readonly T[]', 'unique symbol',
+    'T extends U ? keyof T : never', '[T, U]', '[]', '{}', 'Record<string, T>', 'Array<keyof T>'];
+  const members = ['[K in X]: boolean', '[K in X]?: T[K]', 'readonly [K in X]: boolean', '-readonly [K in X]-?: boolean', '[K in X]', '[K in X]: boolean;', '[K in X as (K)]: boolean'];
+  let accepted = 0;
+  let limit = 0;
+  for (const type of types) {
+    for (const shape of ['X', '(X)', '((X))', '(X)[]', '[X]', '(X) | U']) {
+      for (const member of members) {
+        for (const tail of [' => null as never;\n', ' => T']) {
+          const code = `export default <T extends object>(p: T): ({ ${member.replace('X', shape.replace('X', type))} })${tail}`;
+          if (hasDefaultExport(code)) {
+            accepted += 1;
+            assert.equal(parses(code), true, `TypeScript refuses ${JSON.stringify(code)}`);
+            if (babel) assert.equal(babelParses(code), true, `Babel refuses ${JSON.stringify(code)}`);
+          } else if (parses(code)) {
+            limit += 1;
+            assert.ok(shape !== 'X' && shape !== '(X)[]', `refused, and TypeScript parses ${JSON.stringify(code)}`);
+          }
+        }
+      }
+    }
+  }
+  // Both readings are met, many times.
+  assert.ok(accepted > 1000 && limit > 50, `accepted ${accepted}, refused as the known limit ${limit}`);
+});
+
+// `await` in the key of a parenthesised mapped type. TypeScript parses a return type outside the await context — an `async` arrow's too — so `await` there is a name unless
+// a word, a number or a string follows it on its line: `K in (await)` is an expression, the braces are a binding pattern, and the parentheses hold a function type's
+// parameters, which take the arrow's `=>` (`'=>' expected`). Babel refuses `await` as a name in a module. The gate never reads such a key as a mapped type's: the cut is
+// refused, and a function type with a `|` after its `=>` is accepted, as TypeScript reads both. [what, key type]
+const AWAIT_MAPPED_KEYS = [
+  ['`await` in parentheses', '(await)'], ['`await` in two pairs of parentheses', '((await))'], ['`await` in a tuple', '[await]'], ['`await` and a non-null assertion', '(await!)'],
+  ['`await` in parentheses, remapped', '(await) as K'], ['`await` in parentheses and a union', '(await) | U'], ['`await` before a line break', '(await\n)'],
+];
+
+test('`await` in the key of a parenthesised mapped type leaves the braces a binding pattern, as TypeScript reads them, sync and async', () => {
+  const ts = loadTypescriptOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  for (const [what, key] of AWAIT_MAPPED_KEYS) {
+    for (const modifier of ['', 'async ']) {
+      const head = `export default ${modifier}<T,>(p: T): ({ [K in ${key}]: boolean })`;
+      // [page, whether it is accepted]: the cut and a page whose `=>` the function type takes are refused; the arrow after the function type's own return type is not.
+      for (const [code, expected] of [[`${head} => T`, false], [`${head} => null as never;\n`, false], [`${head} => | T | U => null as never;\n`, true]]) {
+        assert.equal(hasDefaultExport(code), expected, `${what}: ${JSON.stringify(code)}`);
+        if (ts) assert.equal(parses(code), expected, `TypeScript reads ${JSON.stringify(code)} the same`);
+      }
+    }
+  }
+  // A `/` after `await` divides, to TypeScript, where `await` is a name, and the page is refused, as TypeScript refuses it (the gate reads no regular expression as a
+  // key's operand: the known limit above).
+  for (const modifier of ['', 'async ']) {
+    const code = `export default ${modifier}<T,>(p: T): ({ [K in await /r/]: boolean }) => | T | U => null as never;\n`;
+    assert.equal(hasDefaultExport(code), false, code);
+    if (ts) assert.equal(parses(code), false, `TypeScript refuses ${JSON.stringify(code)}`);
+  }
+});
+
+// [what, mapped type, TypeScript parses the page, Babel parses it]: what a key or member type may hold — types only TypeScript's parser takes and leaves to its checker
+// (a predicate, a JSDoc type, a reserved word for a type's name, `readonly` before a name, a type parameter named by a word strict code reserves), types both parsers
+// take, and tokens whose spelling only a parser checks (an escaped keyword, a legacy octal number, consecutive numeric separators, a string escape out of range) beside
+// their valid neighbours. The known limit above reads every such page's braces as a binding pattern, so no token in them can make the gate accept the page.
+const MAPPED_TYPE_TOKENS = [
+  ['a predicate for the key type', '{ [K in (asserts x)]: boolean }', true, false], ['a predicate of `this` for the key type', '{ [K in (asserts this)]: boolean }', true, false],
+  ['a predicate with `is` for the key type', '{ [K in (asserts x is T)]: boolean }', true, false],
+  ['a JSDoc nullable key type', '{ [K in (?T)]: boolean }', true, false], ['the JSDoc unknown type', '{ [K in (?)]: boolean }', true, false],
+  ['the JSDoc any type', '{ [K in (*)]: boolean }', true, false], ['a JSDoc function type', '{ [K in (function(x): T)]: boolean }', true, false],
+  ['`function` for a type', '{ [K in (function)]: boolean }', true, false], ['a reserved word for a type', '{ [K in (if)]: boolean }', true, false],
+  ['`delete` for a type', '{ [K in (delete)]: boolean }', true, false], ['`class` for a type', '{ [K in (class)]: boolean }', true, false],
+  ['`readonly` before a name', '{ [K in (readonly T)]: boolean }', true, false], ['`readonly` twice', '{ [K in (readonly readonly T[])]: boolean }', true, false],
+  ['`infer` and a word strict code reserves', '{ [K in (infer yield)]: boolean }', true, false],
+  ['a type parameter named `yield`', '{ [yield in (keyof T)]: boolean }', true, false], ['a type parameter named `static`', '{ [static in (keyof T)]: boolean }', true, false],
+  ['`readonly` before an array type', '{ [K in (readonly T[])]: boolean }', true, true], ['`readonly` before an array of tuples', '{ [K in (readonly [T][])]: boolean }', true, true],
+  ['`infer` and a name', '{ [K in (T extends Array<infer U> ? U : never)]: boolean }', true, true], ['`keyof this`', '{ [K in (keyof this)]: boolean }', true, true],
+  ['an escaped reserved word for the member type', '{ [K in (keyof T)]: \\u0069f }', true, false],
+  ['an escaped reserved word in the `as` clause', '{ [K in (keyof T) as \\u0069f]: boolean }', true, false],
+  ['a reserved word in the `as` clause', '{ [K in (keyof T) as if]: boolean }', true, false],
+  ['a legacy octal number in the `as` clause', '{ [K in (keyof T) as 01]: boolean }', false, false],
+  ['consecutive numeric separators in the `as` clause', '{ [K in (keyof T) as 1__0]: boolean }', false, false],
+  ['a string escape out of range in the `as` clause', '{ [K in (keyof T) as "\\u{110000}"]: boolean }', false, false],
+  ['an escaped name for the member type', '{ [K in (keyof T)]: \\u0054 }', true, true], ['a number in the `as` clause', '{ [K in (keyof T) as 1]: boolean }', true, true],
+  ['an octal number in the `as` clause', '{ [K in (keyof T) as 0o1]: boolean }', true, true], ['a numeric separator in the `as` clause', '{ [K in (keyof T) as 1_0]: boolean }', true, true],
+];
+
+test('known limit: a parenthesised mapped type is refused whatever its key and member types spell, what only one parser takes or neither does included', () => {
+  const ts = loadTypescriptOracle();
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (const [what, mapped, typescriptParses, babelParsesIt] of MAPPED_TYPE_TOKENS) {
+    for (const modifier of ['', 'async ']) {
+      const code = `export default ${modifier}<T,>(p: T): (${mapped}) => null as never;\n`;
+      assert.equal(hasDefaultExport(code), false, `${what}: refused: ${JSON.stringify(code)}`);
+      if (ts) assert.equal(parses(code), typescriptParses, `TypeScript ${typescriptParses ? 'parses' : 'refuses'} ${JSON.stringify(code)}`);
+      if (babel) assert.equal(babelParses(code), babelParsesIt, `Babel ${babelParsesIt ? 'parses' : 'refuses'} ${JSON.stringify(code)}`);
+    }
+  }
+});
+
+// The mapped types of a parenthesised return type, their key types drawn from a vocabulary that holds what a key may be — a type, an expression, both or neither, `await`
+// and the words strict code reserves, the JSDoc types, predicates, reserved words, escaped words, numbers and strings a parser refuses — each in parentheses, in two
+// pairs, in a tuple, remapped and in a union: the page that only the mapped type's reading accepts is refused for every one of them. With both parser oracles set, both
+// parsers parse many of those pages (the known limit).
+test('mapped types in a parenthesised return type: a key type in a group is never read as a mapped type\'s, whatever the group holds', () => {
+  const ts = loadTypescriptOracle();
+  const babel = loadBabelOracle();
+  const parses = (code) => ts.createSourceFile('page.tsx', code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX).parseDiagnostics.length === 0;
+  const babelParses = (code) => {
+    try {
+      babel.parse(code, { sourceType: 'module', plugins: ['jsx', 'typescript'] });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const atoms = ['keyof T', 'T', 'await', 'await x', 'await\n', 'yield', 'yield x', 'let', 'static', 'async', 'of', 'asserts', 'asserts x', 'asserts x is T', 'this is T', 'x is T',
+    'this', 'super', 'null', 'void', 'void 0', 'typeof', 'typeof x', 'typeof await', 'delete', 'delete x', 'new', 'new X', 'if', 'const', 'class', 'enum', 'function', '?T', 'T?', '?', '!T',
+    'T!', '*', '-1', '1n', '"a"', 'readonly T', 'readonly T[]', 'readonly [T]', 'unique symbol', 'infer U', 'infer yield', 'T[]', 'T[number]', 'T[if]', '[T]', '[if]', '[]', '{}',
+    'A.B<C>', 'A<if>', 'A<>', 'T extends U ? X : Y', 'T | U', 'x.y', 'f()', 'f(await)', 'a + b', 'a ? b', 'x!', '!x', '/re/', '/re/gg', 'x as T', 'f<T>', 'a < b', 'x in y',
+    'keyof await', 'keyof yield', 'keyof if', '\\u0061wait', '\\u0061wait x', '\\u0069f', 'keyof \\u0069f', '\\u0054', '01', '1__0', '0o1', '1_0', '"\\u{110000}"', '"\\u0041"'];
+  let limit = 0;
+  for (const atom of atoms) {
+    for (const shape of ['(X)', '((X))', '[X]', '(X) as K', '(X) | U']) {
+      for (const modifier of ['', 'async ']) {
+        const code = `export default ${modifier}<T,>(p: T): ({ [K in ${shape.replace('X', atom)}]: boolean }) => null as never;\n`;
+        assert.equal(hasDefaultExport(code), false, JSON.stringify(code));
+        if (ts && babel && parses(code) && babelParses(code)) limit += 1;
+      }
+    }
+  }
+  if (ts && babel) assert.ok(limit >= 60, `refused, and both parsers parse it: ${limit}`);
 });
 
 // An arrow with no type parameters is read as it always was (defaultExportIsComplete reads it, not genericArrowIsComplete), whatever its return type holds.

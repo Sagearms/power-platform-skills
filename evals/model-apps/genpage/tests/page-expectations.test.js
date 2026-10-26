@@ -161,6 +161,24 @@ test('eval 5: components and utilities are top level; handlers that close over s
 };`), []);
 });
 
+// A check that needs a page's function scopes reads them through this export rather than keeping a second scope reader.
+// A missing export must fail here, by name — never surface later as a TypeError a caller turns into a skip — and
+// exporting it changes nothing about the top-level check above.
+test('tsx-structure exports its function scope reader, and the top-level check is unchanged by it', () => {
+  const structure = require('../lib/tsx-structure.js');
+  assert.equal(typeof structure.functionScopes, 'function', 'functionScopes is exported');
+  const code = structure.sourceView(`function load(id: string) { return id; }
+const PageBody = (props: Props) => { const go = async () => { await load('x'); }; return null; };`).code;
+  const scopes = structure.functionScopes(code);
+  assert.deepEqual(scopes.map((scope) => scope.params).sort((a, b) => a.join().localeCompare(b.join())), [[], ['id'], ['props']]);
+  assert.ok(scopes.every((scope) => scope.start < scope.end && code.slice(scope.start, scope.end).trim()), 'each scope is a body range');
+  assert.deepEqual(nestedDefinitionProblems(`function PageBody(props: Props) {
+  const { dataApi } = props;
+  async function save() { await dataApi.createRow('task', {}); }
+  return null;
+}`), [], 'a handler that closes over the props is not a nested utility');
+});
+
 // --- Eval 12: the revised plan -----------------------------------------------------------------------
 
 const E12 = '12-account-plan-revision';
@@ -350,6 +368,58 @@ test('eval 4: a label element that shows nothing names no control', () => {
     for (const shown of ['Title', "{'Title'}", "{translate('title')}", '{titleLabel}', '<span>Title</span>']) {
       assertPass(grade(LABELS, labelled(`<${tag} htmlFor="title">${shown}</${tag}>`)));
     }
+  }
+});
+
+// A comment is no value: an expression that is empty once its comments are left out (`{/* hidden */ null}`,
+// `{/* none */ ''}`) names nothing, as an attribute's value and as a label element's child. The comments are the
+// ones the plugin's lexer finds, so comment delimiters inside a string are text, and a value beside a comment counts.
+test('eval 4: an empty value beside a comment is no label', () => {
+  const TITLE = '<Field label="Title">\n                        <Input\n                            aria-label="Title"';
+  const fieldLabel = (value) => withPage(E4, 'page.tsx', [TITLE, `<Field label={${value}}>\n                        <Input`]);
+  const ariaLabel = (value) => withPage(E4, 'page.tsx', [TITLE, `<Field>\n                        <Input\n                            aria-label={${value}}`]);
+  const labelled = (label) => withPage(E4, 'page.tsx', [TITLE, `<Field>\n                        ${label}\n                        <Input\n                            id="title"`]);
+  for (const empty of ['/* hidden */ null', "/* none */ ''", 'null /* hidden */', '/* a */ /* b */ undefined', '// none\n false']) {
+    assertFail(grade(LABELS, fieldLabel(empty)), /<Input> has no aria-label, aria-labelledby or label/);
+    assertFail(grade(LABELS, ariaLabel(empty)), /<Input> has no aria-label, aria-labelledby or label/);
+    for (const tag of ['label', 'Label']) {
+      assertFail(grade(LABELS, labelled(`<${tag} htmlFor="title">{${empty}}</${tag}>`)), /<Input> has no aria-label, aria-labelledby or label/);
+      assertFail(grade(LABELS, labelled(`<${tag} htmlFor="title"><span>{${empty}}</span></${tag}>`)), /<Input> has no aria-label, aria-labelledby or label/);
+    }
+  }
+  // An attribute holding only a comment does not compile (an attribute's expression may not be empty); it names nothing either.
+  assertFail(grade(LABELS, ariaLabel('/* none */')), /<Input> has no aria-label, aria-labelledby or label/);
+  for (const shown of ["/* shown */ 'Title'", "translate('title') /* shown */", "'/* not a comment */'", '// a note\n titleLabel']) {
+    assertPass(grade(LABELS, fieldLabel(shown)));
+    assertPass(grade(LABELS, ariaLabel(shown)));
+    assertPass(grade(LABELS, labelled(`<label htmlFor="title">{${shown}}</label>`)));
+  }
+});
+
+// TypeScript and Babel decode a character reference in JSX text and in an attribute's string, so a label written
+// only in references shows the characters they stand for. It names its control unless every reference stands for
+// white space (`&nbsp;`, `&#32;`): that shows nothing, like a literal non-breaking space. A reference JSX does not
+// decode (`&nosuch;`, `&#X54;`) is shown as written.
+test('eval 4: a label written in character references names its control; one of white space does not', () => {
+  const TITLE = '<Field label="Title">\n                        <Input\n                            aria-label="Title"';
+  const labelled = (label) => withPage(E4, 'page.tsx', [TITLE, `<Field>\n                        ${label}\n                        <Input\n                            id="title"`]);
+  for (const tag of ['label', 'Label']) {
+    for (const shown of ['&#84;&#105;&#116;&#108;&#101;', '&#x54;', '&amp;', '&eacute;', '&nosuch;', '&#X54;', '<span>&#84;</span>', '&#x54;&#x69;tle', '&nbsp;Title']) {
+      assertPass(grade(LABELS, labelled(`<${tag} htmlFor="title">${shown}</${tag}>`)));
+    }
+    for (const blank of ['&nbsp;', '&#32;', '&#x20;&#160;', '&ensp;&emsp;&thinsp;', ' &nbsp; &#10; ', '<span>&nbsp;</span>']) {
+      assertFail(grade(LABELS, labelled(`<${tag} htmlFor="title">${blank}</${tag}>`)), /<Input> has no aria-label, aria-labelledby or label/);
+    }
+  }
+  const fieldLabel = (value) => withPage(E4, 'page.tsx', [TITLE, `<Field label="${value}">\n                        <Input`]);
+  const ariaLabel = (value) => withPage(E4, 'page.tsx', [TITLE, `<Field>\n                        <Input\n                            aria-label="${value}"`]);
+  for (const blank of ['&nbsp;', '&#32;', '&#xA0;', '\u00a0']) {
+    assertFail(grade(LABELS, fieldLabel(blank)), /<Input> has no aria-label, aria-labelledby or label/);
+    assertFail(grade(LABELS, ariaLabel(blank)), /<Input> has no aria-label, aria-labelledby or label/);
+  }
+  for (const shown of ['&#84;&#105;&#116;&#108;&#101;', '&amp;', 'R&D', '&#X54;']) {
+    assertPass(grade(LABELS, fieldLabel(shown)));
+    assertPass(grade(LABELS, ariaLabel(shown)));
   }
 });
 

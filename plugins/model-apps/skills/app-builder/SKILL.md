@@ -62,7 +62,8 @@ prod-ready** app; don't under-build (a bare table list) or over-build (surfaces 
   `100000003`, because they are assigned per publisher. Resolve by label via `getOptions()`
   (see `references/app-spec-schema-advanced.md` → webResources). Note also that command and web-resource
   **edits do not redeploy on rebuild** — the phases reuse what exists, so changing a button or a
-  script means deleting it first. This does not apply to recovery of the build's own
+  script means deleting it first (the build warns, and verify fails, when a web resource's deployed
+  content differs from the spec's). This does not apply to recovery of the build's own
   `WEB_RESOURCE_UNVERIFIED` row: keep that row and the same build workspace, then follow its halt.
 - **Form logic without code** — `businessRules[]`: show/hide, lock/unlock, set-required and
   set-value, driven by a condition on the record. **Reach for a business rule before form JS** when
@@ -581,7 +582,11 @@ columns bind, which the platform refuses to delete while the table exists, and i
 business rule on it could not be deleted (the rule's activated copy can never be deleted once its table is gone), so
 a re-run deletes the rule first, then the table and what was kept with it. It never deletes the solution's
 **publisher** (the build reuses one by prefix, and other solutions may share it); its closing summary says so in one line,
-so tell the user the publisher stays and can be removed in Maker once nothing uses it. **Dry-run by default**; add `--apply
+so tell the user the publisher stays and can be removed in Maker once nothing uses it. **Known limit — generative pages on
+forms:** teardown deletes the app's generative pages even when a form still embeds one (the `MscrmControls.UxAgentControl`
+control); the platform records no dependency for that and teardown reads no form, so the form is left pointing at a deleted
+page. When the app has pages, tell the user before `--apply` and have them take each page off any form that shows it (or delete
+that form) first. **Dry-run by default**; add `--apply
 --allow-destructive` to actually delete (`--clear-workspace` also prunes `.maker-workspace/`).
 **`--allow-destructive` is required for `teardown --apply`** — without it teardown refuses and
 touches nothing.
@@ -705,6 +710,9 @@ not everything:**
 - **Does NOT round-trip:** `forms[]`, `views[]`, `charts[]`, `commands[]` — they come back empty.
   All four **survive on the live app** (a rebuild preserves them by discovery), so a plain edit is
   safe; they just aren't editable through the downloaded spec. Change them in Maker or a fresh spec.
+  The download names every one it leaves out — the command-bar buttons of the app's tables included —
+  in its `NOTE` and its result's `notRoundTripped`, and lists them under `descriptionInventory` in the
+  spec: tell the user before they rebuild the spec in another environment, which would not have them.
 - **Roles are not in the spec, and a rebuild leaves them as they are.** A download carries no
   `personas[]`: the roles associated with the app stay as the environment has them. Keep `personas[]`
   out when you extend an app whose roles somebody else owns — a persona's role is converged to exactly
@@ -733,7 +741,12 @@ connector — give the binding the logical name of a reference that is for the r
 binding's `connectorId` to the one that environment has, and never pick a reference for the user — and its
 warnings say by name each reference or Custom API that is not there yet, a reference that has no connection, an
 operation the custom connector there does not define, and what it could NOT check (a row that did not say its
-connector or connection, or operations no custom connector definition could prove): relay them. Do not write bindings into a
+connector or connection, or operations no custom connector definition could prove): relay them. A binding named
+exactly `WhoAmI` or `RetrieveVersion` is a reviewed built-in Dataverse operation, not a Custom API: the pull lists it
+under `neededInTarget.dataverseOperations` (nothing to deploy), and a rebuild reads nothing for it and says
+`These are reviewed built-in operation names; their availability in this environment or player and the signed-in
+user's permissions were not checked.` — relay that too, never as "missing" and never as "compatible"
+(`references/dataverse-operations.md`). Do not write bindings into a
 spec yourself — they come from a page a pull read — and when you reset a page to `intent` to regenerate it, delete
 its bindings from the spec: the generator writes no connector code.
 

@@ -658,6 +658,79 @@ test('eval 15: genpage.js types picks up an enum registration for every planned 
   assertSkip(grade(text, { ...committed(E15), runtimeTypes: null }), /RuntimeTypes\.ts was not captured/);
 });
 
+// The input JSON as agents/genpage-entity-builder.md Step 4 has the entity-builder write it, for eval 15's plan: each Choice option is its
+// label, in the plan's order. The capture did not keep its input, so the cases below hand it one.
+const TICKET_CHOICES = "Phase 2b (Entity Builder): cr_ticket is provisioned with choice columns via provision-entities.js input JSON; each picklist option is written as its label, in the plan's order (numbered 100000000 + index)";
+function ticketInput(priority = ['Low', 'Medium', 'High', 'Critical'], status = ['Open', 'In Progress', 'Resolved', 'Closed']) {
+  return {
+    solution: { uniqueName: 'Crdec34', publisherPrefix: 'cr' },
+    entities: [{
+      schemaName: 'cr_Ticket', displayName: 'Ticket', pluralName: 'Tickets',
+      primaryAttribute: { schemaName: 'cr_name', displayName: 'Name', maxLength: 100 },
+      columns: [
+        { schemaName: 'cr_Priority', displayName: 'Priority', type: 'Choice', options: priority },
+        { schemaName: 'cr_Status', displayName: 'Status', type: 'Choice', options: status },
+        { schemaName: 'cr_DueDate', displayName: 'Due Date', type: 'DateTime', dateFormat: 'DateOnly' },
+      ],
+    }],
+    relationships: [],
+  };
+}
+const withInput = (input) => ({ ...committed(E15), artifacts: { ...committed(E15).artifacts, 'provision-input.json': typeof input === 'string' ? input : JSON.stringify(input) } });
+
+test('eval 15: the choice options of the input JSON are labels in the plan\'s order, as provision-entities.js takes them', () => {
+  assertPass(grade(TICKET_CHOICES, withInput(ticketInput())));
+  // A label in several languages is a label too.
+  assertPass(grade(TICKET_CHOICES, withInput(ticketInput([{ 1033: 'Low', 1036: 'Bas' }, 'Medium', 'High', 'Critical']))));
+  // The shape the entity-builder page used to show: refused by the plugin's own gate, before anything is written.
+  const labelValue = ticketInput(['Low', 'Medium', 'High', 'Critical'].map((label, i) => ({ label, value: 100000000 + i })));
+  assertFail(grade(TICKET_CHOICES, withInput(labelValue)), /provision-entities\.js refuses the captured input: .*options\[0\]: 'label' is not an LCID/);
+  assertFail(grade(TICKET_CHOICES, withInput(ticketInput(['Medium', 'Low', 'High', 'Critical']))), /ticket priority options are "Medium", "Low", "High", "Critical", but the plan numbers Low, Medium, High, Critical from 100000000/);
+  assertFail(grade(TICKET_CHOICES, withInput(ticketInput(undefined, ['Open', 'Resolved', 'Closed']))), /ticket status options are .*, but the plan numbers Open, In Progress, Resolved, Closed/);
+  const noStatus = ticketInput();
+  noStatus.entities[0].columns.splice(1, 1);
+  assertFail(grade(TICKET_CHOICES, withInput(noStatus)), /declares no ticket status column/);
+  const textStatus = ticketInput();
+  textStatus.entities[0].columns[1] = { schemaName: 'cr_Status', displayName: 'Status', type: 'Text' };
+  assertFail(grade(TICKET_CHOICES, withInput(textStatus)), /ticket status is Text, not a Choice column/);
+  assertFail(grade(TICKET_CHOICES, withInput('{ not json')), /provision-input\.json is not JSON/);
+  assertFail(grade(TICKET_CHOICES, { ...withInput(ticketInput()), workflowLog: committed(E15).workflowLog.replace('--input @D:/temp/support-tickets/provision-input.json ', '') }), /not run with --input <json>/);
+});
+
+test('eval 15: a capture that did not keep its input JSON is skipped, and a current fixture without it fails', () => {
+  assertSkip(grade(TICKET_CHOICES, committed(E15)), /provision-input\.json was not captured/);
+  assertFail(grade(TICKET_CHOICES, { ...committed(E15), contractVersion: 2, manifest: { contractVersion: 2, provenance: 'synthetic' } }), /provision-input\.json was not captured/);
+});
+
+// A table is provisioned by a run that APPLIED its input: provision-entities.js without --apply only plans, writes nothing, and answers
+//   { "ok": true, "dryRun": true, "plan": [ … ] }
+// so such a run is no provisioning, however good its input. The input graded is the one the applying run was handed, not a preview's.
+function provisionedBy(events, artifacts) {
+  return { ...committed(E15), contractVersion: 2, manifest: { contractVersion: 2, provenance: 'synthetic' }, artifacts: { ...committed(E15).artifacts, ...artifacts }, events };
+}
+const provisionRun = (id, input, flags, result) => ({ id, command: `node scripts/provision-entities.js --env https://contoso.crm.dynamics.com --input @${input}${flags}`, result });
+
+test('eval 15: a dry run of provision-entities.js provisions nothing, and the input graded is the applying run\'s', () => {
+  const good = JSON.stringify(ticketInput());
+  const labelValue = JSON.stringify(ticketInput(['Low', 'Medium', 'High', 'Critical'].map((label, i) => ({ label, value: 100000000 + i }))));
+  const applied = { ok: true, entities: [{ schemaName: 'cr_Ticket', logicalName: 'cr_ticket', entitySetName: 'cr_tickets' }] };
+  const planned = { ok: true, dryRun: true, plan: [{ step: 'createTable', schemaName: 'cr_Ticket' }] };
+  assertPass(grade(TICKET_CHOICES, provisionedBy([provisionRun('apply', 'provision-input.json', ' --apply', applied)], { 'provision-input.json': good })));
+  // Planned only: no --apply, and the CLI's own dry-run answer.
+  assertFail(grade(TICKET_CHOICES, provisionedBy([provisionRun('plan', 'provision-input.json', '', planned)], { 'provision-input.json': good })),
+    /provision-entities\.js was not run with --input <json> --apply/);
+  // An answer that says it was a dry run is no apply, whatever flags were recorded with it.
+  assertFail(grade(TICKET_CHOICES, provisionedBy([provisionRun('apply', 'provision-input.json', ' --apply', planned)], { 'provision-input.json': good })),
+    /provision-entities\.js was not run with --input <json> --apply/);
+  // A preview with another input file, then the apply: the apply's input decides — either way round.
+  const previewThenApply = [provisionRun('plan', 'preview-input.json', '', planned), provisionRun('apply', 'provision-input.json', ' --apply', applied)];
+  assertPass(grade(TICKET_CHOICES, provisionedBy(previewThenApply, { 'preview-input.json': labelValue, 'provision-input.json': good })));
+  assertFail(grade(TICKET_CHOICES, provisionedBy(previewThenApply, { 'preview-input.json': good, 'provision-input.json': labelValue })),
+    /provision-entities\.js refuses the captured input: .*options\[0\]: 'label' is not an LCID/);
+  // The applying run's input was not kept: a current fixture fails, though the preview's was.
+  assertFail(grade(TICKET_CHOICES, provisionedBy(previewThenApply, { 'preview-input.json': good })), /provision-input\.json was not captured/);
+});
+
 // --- Eval 19 -----------------------------------------------------------------------------------
 
 const E19 = '19-add-weather-connector';

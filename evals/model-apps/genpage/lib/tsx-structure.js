@@ -473,4 +473,6 @@ function nestedDefinitionProblems(content) {
 module.exports = {
   sourceView, jsxElements, jsxTextRuns, declarationSource, matchingClose, patternNames,
   namedFunctions, nestedDefinitionProblems, withoutComments,
+  // Exported so that a check needing a page's function scopes reads them through this reader instead of a second one.
+  functionScopes,
 };

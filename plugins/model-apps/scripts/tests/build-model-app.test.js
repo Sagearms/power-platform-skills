@@ -2513,7 +2513,7 @@ test('the verify options carry the ACTUAL phase list, not a constant', () => {
   // Asserted on the SOURCE because the value has to be the caller's own `opts.phases`: a test that
   // merely passes a phase list through would still accept `phases: PHASES`.
   const src = fs.readFileSync(path.join(__dirname, '..', 'build-model-app.js'), 'utf8');
-  assert.match(src, /deps\.verify\(spec, \{ environmentSkipped: r\.skipped, phases: opts\.phases(, baselineSpec: opts\.baselineSpec)?(, languageCode: opts\.languageCode, preResolvedLanguageCode: opts\.preResolvedLanguageCode)? \}\)/,
+  assert.match(src, /deps\.verify\(spec, \{ environmentSkipped: r\.skipped, phases: opts\.phases(, baselineSpec: opts\.baselineSpec)?(, languageCode: opts\.languageCode, preResolvedLanguageCode: opts\.preResolvedLanguageCode)?(, appDir: opts\.appDir)? \}\)/,
     'verify must receive the invocation\'s OWN phases — a constant re-breaks the --changed-only fast path');
 });
 
@@ -2581,8 +2581,11 @@ test('the build hands verify the language it wrote its labels in', async () => {
   await buildModelApp(desk, { apply: true, env: 'https://x', verify: true, preResolvedLanguageCode: 1031 }, { sdk, verify });
   assert.strictEqual(received.languageCode, undefined);
   assert.strictEqual(received.preResolvedLanguageCode, 1031);
-  // The rest of the options are exactly what they were.
-  assert.deepStrictEqual(Object.keys(received).sort(), ['baselineSpec', 'environmentSkipped', 'languageCode', 'phases', 'preResolvedLanguageCode']);
+  // The rest of the options are exactly what they were, and the app folder, from which verify reads a web resource's contentPath to
+  // compare its deployed content.
+  assert.deepStrictEqual(Object.keys(received).sort(), ['appDir', 'baselineSpec', 'environmentSkipped', 'languageCode', 'phases', 'preResolvedLanguageCode']);
+  await buildModelApp(desk, { apply: true, env: 'https://x', verify: true, appDir: path.join(__dirname, '..', '..', 'samples') }, { sdk, verify });
+  assert.strictEqual(received.appDir, path.join(__dirname, '..', '..', 'samples'), 'the folder the build read the spec\'s sources from');
 });
 
 test('verify NARRATES what it could not verify beside its PASS — it is neither a pass nor a failure — and the result carries it', async () => {
@@ -2702,6 +2705,7 @@ test('main changed-only full-fast-noop cycle uses the real flow', async () => {
   const os = require('node:os');
   const { loadCli } = require('./helpers/cli-harness.js');
   const { makeSimpleMockSdk } = require('./helpers/mock-sdk.js');
+  const { withPageType, PAGE_TYPE } = require('./helpers/page-component-type.js');
   const snapshotStore = require('../lib/apply-snapshot-store.js');
   const { sha256 } = require('../lib/hash.js');
   const genpageSdk = require('../lib/genpage-sdk.js');
@@ -2784,7 +2788,8 @@ test('main changed-only full-fast-noop cycle uses the real flow', async () => {
     assert.ok(row, `web resource ${id} exists`);
     row.content = Buffer.from(o.content, 'utf8').toString('base64');
   };
-  sdk.dataverse = { get: async (url) => {
+  // The page table's component type is answered first: the build's pages join the spec's solution (lib/page-solution.js).
+  sdk.dataverse = { get: withPageType(async (url) => {
     // The shared-page scan lists the apps that were never published: the one app here is published, so it is the only row.
     if (url.startsWith('/appmodules/Microsoft.Dynamics.CRM.RetrieveUnpublishedMultiple()')) {
       return { status: 200, body: { value: state.app ? [{ appmoduleid: state.app.id, appmoduleidunique: appUniqueValue, uniquename: spec.app.uniqueName, componentstate: 0 }] : [] } };
@@ -2793,7 +2798,7 @@ test('main changed-only full-fast-noop cycle uses the real flow', async () => {
     return state.table && !url.includes("LogicalName='entity'")
       ? { status: 200, body: { LogicalName: state.table.logicalName, EntitySetName: state.table.entitySetName } }
       : { status: 404, body: {} };
-  } };
+  }) };
   sdk.queryRecords = async (set, o = {}) => {
     const filter = o.filter || '';
     if (set === 'appmodule') {
@@ -2946,8 +2951,13 @@ test('main changed-only full-fast-noop cycle uses the real flow', async () => {
     assert.strictEqual(fast.verify.ok, true);
     assert.deepStrictEqual(fast.changedOnly.pageKeys, ['overview']);
     assert.deepStrictEqual(uploads, [{ name: 'Overview', pageId: pageIds.Overview, requestedId: pageIds.Overview, code: deployedCode }]);
-    assert.ok(writes.every((w) => w.method === 'updateWebResource' || (w.method === 'addSolutionComponent' && w.args[0].componentType === 61)),
-      `fast apply writes only the page manifest, never the data model or sitemap: ${JSON.stringify(writes)}`);
+    // Each page is re-asserted in the spec's solution, as the manifest is: the one the fast apply writes, and the one it leaves as it is (sdk-build.js, the page manifest
+    // step), which gets the add and no write. This double keeps no solution, so none of them is found there and each is added.
+    assert.ok(writes.every((w) => w.method === 'updateWebResource' || (w.method === 'addSolutionComponent' && (w.args[0].componentType === 61
+      || (w.args[0].componentType === PAGE_TYPE && [pageIds.Overview, pageIds.Detail].includes(w.args[0].componentId))))),
+      `fast apply writes only the page manifest and the solution membership of the app's pages, never the data model or sitemap: ${JSON.stringify(writes)}`);
+    assert.deepStrictEqual(writes.filter((w) => w.method === 'addSolutionComponent' && w.args[0].componentType === PAGE_TYPE).map((w) => [w.args[0].componentId, w.args[0].addRequiredComponents]),
+      [[pageIds.Overview, true], [pageIds.Detail, true]], 'both pages are in the spec\'s solution, with their files: the changed one as it is written, the other once the pages are');
     const eligible = snapshotStore.readSnapshot(workspaceDir);
     assert.strictEqual(eligible.eligible, true);
     assert.notStrictEqual(eligible.generation, baseline.generation);

@@ -32,6 +32,9 @@ This skill orchestrates specialist agents across the create and edit flows:
    (discovery is mutating), then the planner is re-invoked with its contract.
    **`genpage-customapi-builder`** — the same top-level dispatch for server-side
    Custom API (Action/Function) needs; writes `custom-api-bindings.md` + `actions.json`.
+   It also owns the default-off offer of the two built-in Dataverse Functions
+   (`WhoAmI`, `RetrieveVersion`; `dataverse_operation_discovery_required`) and writes
+   `dataverse-operations.md` for a selection made this run.
 3. **`genpage-entity-builder`** — creates Dataverse entities (tables, columns,
    relationships, choices, sample data) via the plugin's Node.js Web API scripts
 4. **`genpage-page-builder`** — generates one complete `.tsx` file per page; multiple
@@ -43,7 +46,8 @@ This skill orchestrates specialist agents across the create and edit flows:
    replaces, discovers, removes, or clears connector bindings; preserves unchanged bindings
    when the edit does not touch them.
    **`genpage-customapi-builder`** — the same top-level dispatch when an edit adds, replaces,
-   discovers, removes, or clears Custom API bindings.
+   discovers, removes, or clears Custom API bindings, or adds, replaces or removes a built-in
+   Dataverse operation binding.
 6. **`genpage-edit-planner`** — reads the downloaded page artifacts, gathers change
    requirements, presents an edit plan, writes `genpage-edit-plan.md`
 
@@ -212,8 +216,8 @@ the log still shows what decided the run:
 | --- | --- | --- |
 | Recording the resolved mode | Nothing to record | Write the mode itself as `Unattended default: interaction mode → unattended (<reason>)` before the first gate. Record it with this marker, not as free prose such as `Interaction mode: unattended` — the evaluator keys on the marker, and prose forms are indistinguishable from an attended log that merely mentions the word (`Mode: unattended = false`, `not unattended`). |
 | Create new / edit existing (step 2) | `AskUserQuestion` | Whatever `$ARGUMENTS` states. With nothing stated, **create new** — the only additive choice. |
-| An agent returns `needs_input` (step 4) | Ask, then re-invoke | Re-invoke with the option the agent marked `"default": true`. If it marked none, **halt**. |
-| Plan approval (step 5) | `EnterPlanMode` / `ExitPlanMode` | Treat the plan as approved and continue to step 6, which still writes `genpage-plan.md` through the planner. The plan is recorded, just not presented. Log this gate as `Unattended default: plan approval → approved (<reason>)` — the evaluator looks for the plan/approval wording and `approved` on that one line, so a paraphrase such as `→ auto-approve` is read as a missing approval record. |
+| An agent returns `needs_input` (step 4) | Ask, then re-invoke | Re-invoke with the option the agent marked `"default": true`. If it marked none, **halt**. For the planner's data-semantics questions, record `Unattended default: <assumption id> / <question id> → <answer> (<reason>)` — the answer word for word, a reason that never contains the word "approved" — and pass the same line back to the planner for the assumption's `Default record`. |
+| Plan approval (step 5) | `EnterPlanMode` / `ExitPlanMode` | Only once every data-semantics question is answered, treat the plan as approved and continue to step 6, which still writes `genpage-plan.md` through the planner. The plan is recorded, just not presented. Log this gate as its own line, `Unattended default: plan approval → approved (<reason>)` — the evaluator reads the words right after the marker, `plan approval`, then the arrow and the whole word `approved`, so a paraphrase such as `→ auto-approve` is read as a missing approval record, and a semantic default that mentions approval never stands in for it. |
 | Browser verification (Phase 7) | Offer it | Skip it. |
 
 **Suppressing a prompt never authorizes destructive work.** Editing an existing
@@ -244,18 +248,25 @@ missing and stop, so the run can be re-driven with the decision supplied.
    `{ "action": "custom_api_discovery_required" }`, invoke `genpage-customapi-builder`
    the same way (same mode, resolved environment URL, plus the returned `pageTables`),
    then re-run the planner with the builder's `## Custom API Bindings` contract and
-   `actions.json` status (see 1b).
+   `actions.json` status (see 1b). A `dataverse_operation_discovery_required` signal —
+   alone or beside `custom_api_discovery_required` — dispatches that same builder **once**
+   for both needs (see 1c).
    If `genpage-connector-builder` or `genpage-customapi-builder` instead reports
    that its declared file or process-execution tools are unavailable, do **not**
    retry the same worker. Record the worker failure, read that worker's agent
    file, and run the discovery-builder workflow inline in this orchestrator
    using the same resolved mode, environment, intent, and safety gates. This
    inline fallback is recovery from task-runtime tool exposure only; it does not
-   bypass connector/custom-API feature gates or user decisions.
+   bypass the `dataverse-operations` feature gate, the Custom API discovery rules or user decisions.
 4. If any agent returns `{ "action": "needs_input", … }`, ask its questions here
    with `AskUserQuestion`, record them in `workflow-log.md`, and re-invoke that
-   agent with the answers. Agents never prompt; they request.
-5. Present the plan with `EnterPlanMode` and get approval via `ExitPlanMode`.
+   agent with the answers. Agents never prompt; they request. The planner asks this way
+   which relationship or filter a request means when metadata leaves several candidates
+   (its Step 4, "Resolve Data Semantics"): pass each answer back with its question id and
+   everything the planner returned, including `<working-dir>/lookup-metadata.json`. Never
+   answer such a question for the maker, and never approve a plan while one is open.
+5. Present the plan with `EnterPlanMode` — its `### Assumptions` first, as the planner returns
+   it, so the maker sees what was assumed before the page list — and get approval via `ExitPlanMode`.
    On a revision request, re-invoke the planner with the requested revisions and
    present the revised plan again.
 6. **On approval, re-invoke `genpage-planner` with the approval outcome _plus
@@ -306,13 +317,16 @@ missing and stop, so the run can be re-driven with the decision supplied.
    If it exists, verify its provenance before Phase 2:
 
    ```powershell
-   node "${PLUGIN_ROOT}/scripts/genpage-plan-provenance.js" verify --plan '<working-dir>/genpage-plan.md' --approved '@<working-dir>/.approved-genpage-plan.md'
+   node "${PLUGIN_ROOT}/scripts/genpage-plan-provenance.js" verify --plan '<working-dir>/genpage-plan.md' --approved '@<working-dir>/.approved-genpage-plan.md' --require-assumptions
    ```
 
    Continue only when the JSON result has `"ok":true`, and record its `writtenHash`
-   in `workflow-log.md`. If the written plan targets other pages than the approved
+   (and `semanticsHash`) in `workflow-log.md`. If the written plan targets other pages than the approved
    plan named — an extra, missing or renamed page file — halt: downstream phases
-   would build pages the user did not approve.
+   would build pages the user did not approve. Halt too when its assumptions, data-semantics
+   decisions or lookup records differ from the approved ones, or are missing from either document
+   (`--require-assumptions`: a newly authored plan carries them all): the maker approved those
+   decisions, not just the file names. The result's `semanticProblems` lists each difference.
 
 #### 1a. Connector discovery is orchestrator-owned and never speculative
 
@@ -366,9 +380,38 @@ detected.
   verify `<working-dir>/actions.json` is a bare JSON array, then re-run the planner with the
   refreshed contract.
 
-The builder remains the single owner of the `custom-api` feature gate: it probes first, writes
-`No custom API bindings.` + `[]` when the gate is off or the page needs no Custom API, and
-performs discovery only when one is required.
+The builder remains the single owner of Custom API discovery, which has no feature flag: it writes
+`No custom API bindings.` and no Custom API row when the page needs no Custom API (`actions.json`
+is then `[]`, unless built-in operation rows were selected — 1c), and performs discovery only when
+one is required.
+
+#### 1c. Built-in Dataverse operations are orchestrator-owned too
+
+`WhoAmI` and `RetrieveVersion` are two reviewed built-in Dataverse Functions a page can call from
+a button — not Custom APIs (`${PLUGIN_ROOT}/references/dataverse-operations.md`). Their offer is
+behind the default-OFF `dataverse-operations` flag, owned by `genpage-customapi-builder`, which
+also stays the one writer of `actions.json` (Custom API rows first, then the built-in rows).
+
+- A planner returns `{ "action": "dataverse_operation_discovery_required", "intent": "...",
+  "resolvedAction": "create" | "edit", "envUrl": "..." }` when the maker affirmatively asks for
+  one of them or for the identity or server version a page should show. A mention, a question,
+  "do not add WhoAmI", or the `whoAmI` of the auth preflight is not that signal. Dispatch the
+  builder once, with both needs when a Custom API is needed too.
+- Selection is the maker's: an affirmative request or an explicit answer to the builder's
+  `needs_input` picker. Ask that question here with `AskUserQuestion`; an unattended run never
+  treats "no answer" as consent, and the selected names stay in this run's context.
+- When the builder reports `dataverse-operations.md` written **this run**, forward its body to
+  the planner as the `## Dataverse Operations` contract, delimited like the other contracts. A
+  file left by an earlier run is not forwarded. With none, the plan has no such section.
+- When it reports `dataverse-operations.md: none — not added this run` — its
+  `dataverse-operations` gate is off, or the maker declined the offer or selected neither —
+  there is no built-in contract: tell the maker that no built-in operation was added, and forward
+  the outcome `none — not added this run` (never a contract) to the planner in this and every
+  later round. The planner then completes the plan without that call instead of signalling
+  again, so the builder is not dispatched a second time for the same request — the edit flow's
+  own rule.
+- In an edit, Edit Phase 4 of edit-flow.md handles this signal, forwards the contract through
+  every edit-planner round, and re-probes the gate before an add or replace is applied.
 
 #### Invocation prompt
 
@@ -385,6 +428,14 @@ Pass a prompt that includes:
   or the literal `No custom API bindings.` when discovery was not needed
 - The Custom API upload file status: `<working-dir>/actions.json` exists and is
   a bare JSON array, or `no actions.json; omit --actions`
+- The answers to every earlier `needs_input` question, each with its question id (and, unattended,
+  its `Unattended default:` line), and the path of `<working-dir>/lookup-metadata.json` when the
+  planner saved one
+- The built-in operation contract, only when this run's builder wrote it: the full body of
+  `<working-dir>/dataverse-operations.md` between `----- BEGIN/END DATAVERSE OPERATIONS -----`
+  delimiters (copied verbatim into an optional `## Dataverse Operations` section right after
+  `## Custom API Bindings`); the outcome `none — not added this run` when this run's builder was
+  dispatched for one and added none (1c); otherwise nothing, and the plan has no such section
 
 Example:
 
@@ -437,6 +488,21 @@ Example:
 > `{ "action": "custom_api_discovery_required", "intent": "<operation>",
 > "resolvedAction": "create" | "edit", "envUrl": "<the environment you resolved>",
 > "pageTables": "<page tables or none>" }` instead of trying to discover it yourself.
+>
+> [Only when this run's builder wrote `dataverse-operations.md`:] The built-in Dataverse
+> operation contract is between the `----- BEGIN/END DATAVERSE OPERATIONS -----` lines below
+> (prompt delimiters, not content). Copy what is between them verbatim into an optional
+> `## Dataverse Operations` section right after `## Custom API Bindings`; with no such block,
+> write no such section. If your clarification reveals an affirmative request for `WhoAmI` or
+> `RetrieveVersion` (or for the identity or server version a page shows) that this contract does
+> not cover, return `{ "action": "dataverse_operation_discovery_required", "intent": "<the
+> maker's words>", "resolvedAction": "create" | "edit", "envUrl": "<the environment you
+> resolved>" }`.
+>
+> [Only when this run's builder added none:] Built-in Dataverse operations: `none — not added
+> this run`. The builder was dispatched for this request and added none (its gate is off, or the
+> maker selected neither): plan the page without that call, write no `## Dataverse Operations`
+> section, and do not return `dataverse_operation_discovery_required` again.
 >
 > Follow the instructions in your agent file. Validate prereqs and confirm auth.
 > The create/edit decision and the resolved environment are supplied to you by the
@@ -535,6 +601,29 @@ this loop, exactly as Phase 1 step 4 does:
 Repeat until it returns a completion rather than a request. Proceeding to Phase 3
 on a `needs_input` return silently drops the decision the user was asked to make.
 
+#### 2c. Reconcile planned lookups (when the plan records any)
+
+A lookup on a table this run creates is recorded `planned` in its page's `#### Lookup metadata` — there was no
+metadata to read before Phase 2. Once the tables exist, and before any page is generated, prove each one:
+
+```powershell
+node "${PLUGIN_ROOT}/scripts/get-lookup-metadata.js" --env '<envUrl>' --tables '<every source table with a recorded lookup>'
+```
+
+Save its one-line JSON answer as `<working-dir>/lookup-metadata.json` (it replaces the planning-time copy). Any
+non-zero exit means the read failed: report it and stop — a failed read is never "no targets". Then run the
+`prepare` command of Phase 1 again and re-invoke `genpage-planner` with `Lookup reconciliation:`, the path of
+that file, the approved plan body and everything it returned before. It may only promote a `planned` lookup to
+`observed` and add its measured paths; a different target set, column or use is a revised plan the maker
+approves again (Phase 1 step 5). Verify the rewritten plan against the same approved body, with the evidence:
+
+```powershell
+node "${PLUGIN_ROOT}/scripts/genpage-plan-provenance.js" verify --plan '<working-dir>/genpage-plan.md' --approved '@<working-dir>/.approved-genpage-plan.md' --require-assumptions --lookup-metadata '<working-dir>/lookup-metadata.json'
+```
+
+Continue only on `"ok":true`; on `"ok":false` halt and show the maker the `semanticProblems` it lists. Do not
+edit the plan yourself: the planner is its one author.
+
 ### Phase 3: App Creation/Selection
 
 Read `genpage-plan.md` for the app decision and the `Solution` line in
@@ -552,8 +641,8 @@ is deployed (see "A new app" there). Carry the app's name and the plan's `Soluti
 - `--solution` is mandatory and takes the solution's **unique name**: `apps.js create` refuses
   a call without it, or with a name no unmanaged solution has.
 
-**If existing app-id:** Use it directly. `apps.js create` is not called, so
-the `Solution` line is informational only for this phase.
+**If existing app-id:** Use it directly. `apps.js create` is not called; the plan's `Solution`
+is still the solution every page this run creates joins (Phase 6 passes it with `--solution`).
 
 ### Phase 4: Generate RuntimeTypes (Conditional)
 
@@ -622,29 +711,12 @@ fills env-specific `ConnectionId` values through solution deployment settings.
 
 ### Phase 4.6: Custom API Bindings (Conditional)
 
-**Re-probe the feature gate here — do not rely on the plan content alone.** A plan
-authored while the flag was ON must not deploy Custom API bindings after it is turned OFF:
-
-```powershell
-node "${PLUGIN_ROOT}/scripts/lib/feature-flags.js" custom-api
-```
-
-**If it prints `disabled`:** Custom API support is OFF. Do not create or pass `actions.json`,
-and never add `--actions` on upload. The plan's `## Custom API Bindings` section still decides
-whether the run may go on: only a body of exactly `No custom API bindings.` continues, with no
-Custom APIs. For an **actual binding table** (a `| Name | Kind | …` header with at least one data
-row), **halt before page generation**. That plan was made while the flag was on, and page
-generation takes the table as permission to emit `executeAction` / `executeFunction` calls —
-deploying them with no bindings leaves pages calling Custom APIs that are not bound. Tell the user
-to turn the flag back on, or re-run planning (the Custom API builder writes no bindings while the
-flag is off). A missing, empty, or malformed section halts too, exactly as in the `enabled`
-branch. (Backstop: `list-custom-apis.js` also fails closed with exit 3 if invoked while OFF.)
-
-**If it prints `enabled`:** read the plan's `## Custom API Bindings` section. The section is
-mandatory: continue with no actions only when its body is exactly `No custom API bindings.`.
-Treat it as bindings only when it contains an actual binding table (a `| Name | Kind | …`
-header with at least one data row). If the section is missing, empty, or malformed, **halt**
-before page generation; do not interpret a planner/schema failure as "no Custom APIs".
+Custom API support has no feature flag, so there is nothing to probe here. Read the plan's
+`## Custom API Bindings` section. The section is mandatory: continue with no Custom API rows only
+when its body is exactly `No custom API bindings.`. Treat it as bindings only when it contains an
+actual binding table (a `| Name | Kind | …` header with at least one data row). If the section is
+missing, empty, or malformed, **halt** before page generation; do not interpret a planner/schema
+failure as "no Custom APIs".
 
 When there are real bindings, the `genpage-customapi-builder` agent already wrote
 `<working-dir>/actions.json` during planning — verify it exists and matches the plan table. If
@@ -653,6 +725,47 @@ it is missing, derive it as a **bare JSON array** of
 `isFunction:false`, Function `true`; `boundEntityLogicalName` only for an entity-bound, non-
 `(Global)`, row) — see `${PLUGIN_ROOT}/references/custom-api.md`. Never the
 `{ "actionBindings": [...] }` object wrapper (the deployed `config.json` shape the upload writes).
+Compare only the **Custom API rows** of `actions.json` with this table: a built-in operation row
+(`WhoAmI`, `RetrieveVersion`) belongs to Phase 4.6b, never fails this match, and is never
+uploaded by this branch alone.
+
+This phase governs the Custom API rows only. Whether `actions.json` is written and passed at all
+is decided once, after Phase 4.6b's gate, in Phase 4.6c — this phase never takes away a built-in
+operation row the plan selected.
+
+### Phase 4.6b: Built-in Dataverse Operations (Conditional)
+
+Only when the plan has a `## Dataverse Operations` section holding the built-in operation table
+— an add or replace of this run — re-probe its own gate:
+
+```powershell
+node "${PLUGIN_ROOT}/scripts/lib/feature-flags.js" dataverse-operations
+```
+
+**If it prints `disabled`:** halt before page generation. Write no replacement `actions.json`,
+pass no `--actions`, and never write `[]` in its place (`[]` is only an explicit clear-all): the
+page keeps the bindings it has. Tell the user to turn the flag back on or re-run planning. An
+absent section, or exactly `No Dataverse operations.`, needs no probe and adds nothing; a
+preserve-only edit never consults this gate.
+
+**If it prints `enabled`:** verify that `actions.json` holds every row of the table as the
+four-key projection the builder wrote (Custom API rows first, then the built-in rows in
+catalogue order). If the builder selected a built-in operation but the plan lost its table,
+halt and re-invoke the planner — do not generate.
+
+### Phase 4.6c: The actions file, decided once (both partitions)
+
+Decide once, after Phase 4.6 and Phase 4.6b, from the complete desired array: the Custom API
+rows of the plan's `## Custom API Bindings` table (none when its body is `No custom API
+bindings.`), then the built-in operation rows of its `## Dataverse Operations` table (none when
+that section is absent or `No Dataverse operations.`; Phase 4.6b has already halted the run if its
+gate was off).
+
+- **Not empty:** `actions.json` must hold exactly that array, as the builder wrote it (Custom API
+  rows first, then the built-in rows in catalogue order) — verify it, and halt rather than
+  generate if it does not. Then the create passes `--actions '<working-dir>/actions.json'`: a page
+  that binds only built-in operations is created with them bound.
+- **Empty:** the create passes no `--actions`.
 
 ### Phase 4.7: Page Telemetry (Conditional)
 
@@ -705,6 +818,17 @@ Before invoking any builders, verify:
   spelling. On any problem, halt and re-plan instead of rewriting filenames here: a renamed
   file is a page the user did not approve, and the provenance check compares page files.
   Duplicate filenames cause silent last-writer-wins data loss under parallel execution.
+- Every relationship and every server-side or client-side filter used in `## Per-Page Specifications` traces to the user's stated text in `## User Requirements` or a named `## Assumptions` entry. The builder introduces no unrecorded business predicate, relationship or roll-up.
+  Validation proves structure, ID resolution, quote presence and agreement with approved structured decisions. It does not prove natural-language entailment, judge materiality, or discover arbitrary contradictory prose. Those remain planner/reviewer responsibilities, supplemented by scenario-specific code checks.
+- **When the plan records any lookup** (a `#### Lookup metadata` table, not `None.`), every one is
+  `observed` and matches the saved metadata read before a page is generated:
+
+  ```powershell
+  node "${PLUGIN_ROOT}/scripts/genpage-plan-provenance.js" verify --plan '<working-dir>/genpage-plan.md' --approved '@<working-dir>/.approved-genpage-plan.md' --require-assumptions --require-observed-lookups --lookup-metadata '<working-dir>/lookup-metadata.json'
+  ```
+
+  Continue only on `"ok":true`. A lookup still `planned` means Phase 2c did not run; a mismatch
+  means the metadata changed since approval — halt and re-plan, never edit the records here.
 
 See `${PLUGIN_ROOT}/references/plan-schema.md` for the full contract.
 
@@ -720,14 +844,17 @@ subagent. Inline the page-builder workflow directly in the orchestrator:
    also read `${PLUGIN_ROOT}/references/connectors.md`. Treat a
    `No connector bindings.` sentinel or an empty/missing/malformed section as
    having no connectors (same contract as Phase 4.5 and genpage-page-builder).
-3b. Only when the Phase 4.6 probe printed `enabled` **and** the plan's
-   `## Custom API Bindings` section contains an **actual binding table** (a
-   `| Name | Kind | …` header with at least one data row), also read
-   `${PLUGIN_ROOT}/references/custom-api.md`. Treat a
+3b. Only when the plan's `## Custom API Bindings` section contains an **actual
+   binding table** (a `| Name | Kind | …` header with at least one data row),
+   also read `${PLUGIN_ROOT}/references/custom-api.md`. Treat a
    `No custom API bindings.` sentinel as no Custom APIs. If the section is
    missing, empty, or malformed, halt before inline generation (same contract as
    Phase 4.6); do not downgrade a planner/schema failure to "no Custom APIs."
-   (A `disabled` probe with a binding table has already halted in Phase 4.6.)
+3c. Only when the Phase 4.6b probe printed `enabled` **and** the plan has a
+   `## Dataverse Operations` table, also read
+   `${PLUGIN_ROOT}/references/dataverse-operations.md` and generate its button-only
+   pattern for exactly those rows. Without that section (or with exactly
+   `No Dataverse operations.`), emit no built-in operation call.
 4. If the plan's Per-Page Specification has `Needs caching: true`, also read
    `${PLUGIN_ROOT}/references/data-caching.md`
 5. If the plan's `## Environment` indicates non-English languages, also read
@@ -893,8 +1020,8 @@ exited 0 is not deployed.
 
 For each `.tsx` file produced, deploy to Power Apps.
 
-If Phase 4.5 wrote `<working-dir>/connectors.json`, or Phase 4.6 wrote `<working-dir>/actions.json`,
-pass the file to the upload (`--connectors` / `--actions`). `genpage-upload.js` writes the bindings into
+If Phase 4.5 wrote `<working-dir>/connectors.json`, pass it with `--connectors`; pass `actions.json` with `--actions` when Phase 4.6c decided so
+(its desired array is not empty — Custom API rows, built-in operation rows, or both). `genpage-upload.js` writes the bindings into
 the page's `config.json` through the SDK, so there is no `--help` to pre-flight and no minimum `pac`
 build for them; a file that is not a JSON array is refused before anything is written. Never silently
 drop bindings.
@@ -911,9 +1038,19 @@ Connector deployment matrix:
   `--connectors`, which clears the page's `connectorBindings`.
 
 Custom API deployment follows the **identical matrix** as connectors, substituting
-`--actions '<working-dir>/actions.json'` for `--connectors`: pass it on create; on an edit only
+`--actions '<working-dir>/actions.json'` for `--connectors`: pass it on create when Phase 4.6c's
+array is not empty; on an edit only
 when bindings changed/added/removed (full replace); omit it on an unrelated edit (the page keeps
-its deployed `actionBindings`); write `[]` and pass it to clear all `actionBindings`.
+its deployed `actionBindings`); write `[]` and pass it to clear all `actionBindings` — on a page
+that also binds a built-in operation (`WhoAmI`, `RetrieveVersion`) only after the maker's clear
+choice naming each one, asked before any binding is reconciled or the plan is approved (edit-flow.md,
+Edit Phase 3) and recorded again right before the upload, because removing every Custom API keeps them
+(edit-flow.md, Edit Phase 3).
+The same array carries the built-in operation rows (`WhoAmI`, `RetrieveVersion`), so the same
+rules hold for them: `--actions` is passed only when the whole desired set changed, a preserve
+omits it, a removal passes the array minus the named entries, and `[]` is passed only for a
+clear-all the maker chose — never as the result of a gate that turned off (Phase 4.6b, or in an edit the
+Edit Phase 4 re-probe, halts instead).
 
 **Deploy through `scripts/genpage-upload.js`.** It writes the page through the SDK — the same page backend
 `/app-builder` uses, signed in with the Azure CLI — and takes the maker's text **by file**
@@ -951,7 +1088,7 @@ in it is neither refused nor escaped.
 
 ```markdown
 ## Phase 6 — Deploy
-- Command: `node "${PLUGIN_ROOT}/scripts/genpage-upload.js" --env '<org-url>' --app-id '<id>' --code-file '<path>' --data-sources '<entities>' --prompt-file '<working-dir>/prompt.txt' --model '<model-id>' --name-file '<working-dir>/page-name.txt' --agent-message-file '<working-dir>/agent-message.txt' --add-to-sitemap`
+- Command: `node "${PLUGIN_ROOT}/scripts/genpage-upload.js" --env '<org-url>' --app-id '<id>' --code-file '<path>' --data-sources '<entities>' --prompt-file '<working-dir>/prompt.txt' --model '<model-id>' --name-file '<working-dir>/page-name.txt' --agent-message-file '<working-dir>/agent-message.txt' --solution '<Solution unique name>' --add-to-sitemap`
 - Prompt scope: full page description from plan's `## User Requirements` (create) — or the delta only (update)
 - Result: page-id = <returned-id>, status = success
 ```
@@ -997,11 +1134,27 @@ node "${PLUGIN_ROOT}/scripts/genpage-upload.js" `
   --prompt-file '<working-dir>/prompt.txt' `
   --model '<current-model-id>' `
   --agent-message-file '<working-dir>/agent-message.txt' `
+  --solution '<Solution unique name>' `
   --add-to-sitemap
 ```
 
 Omit the `--connectors` line when Phase 4.5 did not write `connectors.json`, and the
-`--actions` line when Phase 4.6 did not write `actions.json`.
+`--actions` line when Phase 4.6c decided an empty array — a page that binds only built-in
+operations keeps it.
+
+**Every create passes `--solution` with the plan's `Solution` value** (`## Environment`), so the page
+joins the solution the maker chose, as the tables and the app do. A page joins no solution on its own,
+and adding an app to a solution never brings the pages it shows. The upload checks the solution before
+it writes anything: a name that is not an unmanaged solution stops the upload with nothing made. It adds
+the page last, after the page is written, published and placed, and the result says `"solution"` and
+`"addedToSolution": true`. A system solution such as `Default` already holds every page, so nothing is
+added and the result says `"systemSolution": true`. **An add that fails** exits 1 with
+`"code": "solution-add-failed"` and the page's `pageId`. The page exists and works: do not create it
+again. Run the `add-page-to-solution.js` command that the error names
+(`node "${PLUGIN_ROOT}/scripts/add-page-to-solution.js" '<org-url>' '<Solution unique name>' --page-ids '<page-id>'`).
+Updates (a later edit of the page) do not pass `--solution`, because the page is in the solution
+already. A create that did not finish, run again with `--page-id` added (see below), keeps
+`--solution`: the run that finishes the page also adds it.
 
 **A new app** (the plan says `create new`): there is no app to name yet. Create the app's **first page with no
 `--app-id` and no `--add-to-sitemap`** — a page needs no app, and one created without it is added to none — and make
@@ -1053,8 +1206,9 @@ node "${PLUGIN_ROOT}/scripts/genpage-upload.js" `
 
 For updates, include the `--connectors` line only when this upload intentionally
 replaces or clears connector bindings; otherwise omit it to preserve the
-deployed page's current bindings. The same rule applies to `--actions` for Custom
-API bindings: include it only when this upload intentionally replaces or clears them.
+deployed page's current bindings. The same rule applies to `--actions` for the page's
+`actionBindings` — Custom API and built-in rows alike: include it only when this upload
+intentionally replaces, removes or clears them.
 
 An update that gives no `--name-file`, `--model`, `--data-sources`, `--connectors` or `--actions` keeps the page's own
 name, model, data sources and bindings: the SDK writes only what differs from the page it has just read, so an edit
@@ -1093,10 +1247,10 @@ Phase 3 created nothing, because the platform refuses an app whose navigation is
      --publish
    ```
 
-   It makes the app with one area `Main`, one group `Pages` and a sub-area for the page, titled with the page's name; the app and its sitemap join the solution (a system solution such as `Default` already holds every component, so the result says `systemSolution: true` and an empty `inSolution` — a create into `Default` needs no add and did not fail). **`--publish` is mandatory:** without it the new app stays in draft and the genux runtime URL errors with "app not published". It prints `{ "ok": true, "appId", "uniqueName", "published", "unpublishedChanges", "solution", "navigation", "dataSources", "pinnedViews", … }` — store `appId` for the rest of the run. The create also pins the default public view of each table the page reads into the app's components, so that the maker's "/" picker lists the page's tables (`dataSources` are the tables, `pinnedViews` the views); a `warnings` entry says when a table has no default public view to pin, or when the environment could not take the app's new header and navigation setting, and the app was made all the same.
-3. **The remaining pages.** Upload each with `--app-id '<appId>'` and `--add-to-sitemap` (the create above): each becomes a sub-area of the new app, and the default views of the tables it reads join the app's components with it.
+   It makes the app with one area `Main`, one group `Pages` and a sub-area for the page, titled with the page's name; the app, its sitemap and its page join the solution (`inSolution` lists `app`, `sitemap` and `pages` as each joins; a system solution such as `Default` already holds every component, so the result says `systemSolution: true` and an empty `inSolution` — a create into `Default` needs no add and did not fail). **`--publish` is mandatory:** without it the new app stays in draft and the genux runtime URL errors with "app not published". It prints `{ "ok": true, "appId", "uniqueName", "published", "unpublishedChanges", "solution", "navigation", "dataSources", "pinnedViews", … }` — store `appId` for the rest of the run. The create also pins the default public view of each table the page reads into the app's components, so that the maker's "/" picker lists the page's tables (`dataSources` are the tables, `pinnedViews` the views); a `warnings` entry says when a table has no default public view to pin, or when the environment could not take the app's new header and navigation setting, and the app was made all the same.
+3. **The remaining pages.** Upload each with `--app-id '<appId>'`, `--add-to-sitemap` and `--solution` (the create above): each becomes a sub-area of the new app and joins the solution, and the default views of the tables it reads join the app's components with it.
 
-**A create of the app that failed** exits 1 and prints `{ "ok": false, "code", "error", "written", … }`; `code` and `error` are the SDK's own. `"written": false` means nothing was made: fix what the message names and run it again. `"written": true` means the app or its sitemap exists (`appId`, `sitemapId`, `left`, `published` and `unpublishedChanges` say which and in what state): its unique name is taken, so run it again with `--unique-name '<name>'`, or remove the leftovers first — the error says how. `"written": null` means the platform could not be read back, so the outcome is unknown: look in the environment for what `lookFor` names (the unique name, the app id and the sitemap id the create used) before running it again. `stage` says how far it got, and `inSolution` which of the app and its sitemap joined the solution.
+**A create of the app that failed** exits 1 and prints `{ "ok": false, "code", "error", "written", … }`; `code` and `error` are the SDK's own. `"written": false` means nothing was made: fix what the message names and run it again. `"written": true` means the app or its sitemap exists (`appId`, `sitemapId`, `left`, `published` and `unpublishedChanges` say which and in what state): its unique name is taken, so run it again with `--unique-name '<name>'`, or remove the leftovers first — the error says how. `"written": null` means the platform could not be read back, so the outcome is unknown: look in the environment for what `lookFor` names (the unique name, the app id and the sitemap id the create used) before running it again. `stage` says how far it got, and `inSolution` which of the app, its sitemap and its pages joined the solution (a create that stopped at the `solution` stage made the app: add what is missing with `add-page-to-solution.js '<org-url>' '<Solution unique name>' '<appId>' --page-ids '<page-id>'` — the app's add brings its sitemap, and a component the solution already holds is accepted).
 
 ### Phase 6.5: Navigation Fix-Up (Multi-Page Only)
 
@@ -1149,7 +1303,9 @@ The creates in Phase 6 wrote a base marker beside each uploaded file, using the 
 
 Runs only when the plan's `## Solution Packaging` has `Package into solution: true`.
 Adds the deployed app, the GenPage(s), and any connection references to the
-target solution so they travel cross-environment.
+target solution so they travel cross-environment. (The pages already joined the plan's
+`## Environment` `Solution` in Phase 6; this packages them, with the app and the connection
+references, into the solution `## Solution Packaging` names, which may be another one.)
 
 1. Ensure the solution exists — create it only if it doesn't already exist:
    `node "${PLUGIN_ROOT}/scripts/provision-solution.js" '<envUrl>' '<solutionUniqueName>' '<Friendly Name>' [--publisher '<uniqueName>']`
@@ -1219,6 +1375,8 @@ encoding is not recognised.
 Custom API bindings need **no** extra ALM step: `config.json`'s `actionBindings` travels
 automatically in the `uxagentprojectfile` rows already pulled with the GenPage. The
 referenced Custom APIs are a separate deployment prerequisite (bound by `name`), not added here.
+A built-in operation binding (`WhoAmI`, `RetrieveVersion`) needs nothing at all: it names an
+operation the platform defines, so there is no component to add or deploy.
 
 ### Phase 7: Verify in Browser (Optional)
 
@@ -1288,4 +1446,7 @@ For the edit flow (triggered when the `genpage-planner` returns
 The edit flow has its own 8 phases (Edit Phase 1-8): discover and select target
 app + page via `apps.js list` + `genpage.js list`, download (`genpage.js download`), generate
 RuntimeTypes (`genpage.js types`) if needed, invoke `genpage-edit-planner`, apply the edit inline,
-deploy, verify, summarize.
+deploy, verify, summarize. Built-in operations (`WhoAmI`, `RetrieveVersion`) are classified in Edit
+Phase 3; Edit Phase 4 handles `dataverse_operation_discovery_required`, forwards this run's
+built-in operation contract through every planner round, and re-probes `dataverse-operations`
+before an add or replace is applied — the create flow's Phase 4.6b is not visited.

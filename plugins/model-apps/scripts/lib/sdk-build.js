@@ -143,6 +143,7 @@ const { tableRefs, pinAppTables, publishAppComponents, resolveMainForms, appComp
 const { appWriteTables, appPushTables, preAppTables, publishTablesXml, readSavedNotPublished, describeSavedNotPublished, readAppFormChartTables, describePreAppRefusal, describeUnreadAppComponents } = require('./table-publish.js');
 const { hasUnsyncedEdits } = require('./unsynced-edits.js');
 const { createSolutionMembership, ensureSolutionComponent } = require('./solution-membership.js');
+const { readPageComponentType, pageComponent } = require('./page-solution.js');
 const { openUnconfirmedWebResources } = require('./web-resource-records.js');
 const { openDashboardCreations } = require('./dashboard-creation-records.js');
 const { ownValue } = require('./own-keys.js');
@@ -601,6 +602,27 @@ function webResourceOpts(wr, appDir) {
   else if (wr.contentPath) o.content = fs.readFileSync(resolveAppSource(appDir, wr.contentPath), 'utf8');
   else o.content = '';
   return o;
+}
+
+// How the spec's web resource `wr` compares with the content an environment holds for it — `deployed`, the base64 text a read of
+// `webresourceset` answers in `content` (the published layer, for a plain read):
+//   { state: 'same' }               the bytes the build would write are the deployed bytes
+//   { state: 'differs' }            they are not
+//   { state: 'unknown', reason }    one side cannot be read: the spec's source (a contentPath that is not there), or an answer with no content
+// The bytes are the ones the SDK sends — `contentBase64` as given, `content` as UTF-8 (webResourceOpts) — and compares when it reads a write back
+// to confirm it, so a web resource an earlier build wrote from the same spec compares the same. The ONE comparison behind the build's reuse line
+// and verify's web-resource check, so the two cannot disagree about whether an edit was deployed.
+function webResourceContentState(wr, appDir, deployed) {
+  if (typeof deployed !== 'string') return { state: 'unknown', reason: 'the environment answered no content' };
+  let options;
+  try {
+    options = webResourceOpts(wr, appDir);
+  } catch (err) {
+    const source = typeof wr.contentPath === 'string' && wr.content === undefined && wr.contentBase64 === undefined ? `contentPath ${JSON.stringify(wr.contentPath)}: ` : '';
+    return { state: 'unknown', reason: `the spec's content could not be read (${source}${(err && err.message) || err})` };
+  }
+  const wanted = options.contentBase64 !== undefined ? Buffer.from(String(options.contentBase64), 'base64') : Buffer.from(String(options.content), 'utf8');
+  return { state: Buffer.from(deployed, 'base64').equals(wanted) ? 'same' : 'differs' };
 }
 
 // --- the ordered plan (dry-run + totals) -----------------------------------------------
@@ -3356,6 +3378,10 @@ async function runSdkBuildPhases(spec, opts, owed) {
   //     in the solution). Built before forms so a form event handler can bind its library.
   //     One that an earlier run of this build created or wrote and could not confirm was published (WEB_RESOURCE_UNVERIFIED,
   //     recorded in the workspace) is not reused: its content is written again by id (writeOwnedWebResource).
+  //     The reuse writes nothing — the phase is discover-then-skip, like charts, command bars and dashboards, whose lines say their
+  //     edits are not applied — but it is not silent about the content: the row's deployed (published) content is read with its id and
+  //     compared with what the spec would write (webResourceContentState), and a difference is said in the skip line and as a warning.
+  //     An `external` web resource is a shared one the build reuses as it finds it, so its content is not the spec's to compare.
   if (has('web-resources')) {
     for (const wr of spec.webResources || []) {
       const recordedId = unconfirmedWebResources.idOf(wr.name);
@@ -3365,10 +3391,23 @@ async function runSdkBuildPhases(spec, opts, owed) {
         });
         continue;
       }
-      const existing = await provision.queryRecords('webresource', { select: ['webresourceid'], filter: `name eq '${odataLit(wr.name)}'`, top: 1 });
+      // The row as a plain read answers it (its published layer):
+      //   GET /webresourceset?$select=webresourceid,content&$filter=name eq 'contoso_/scripts/form.js'&$top=1
+      //   { "value": [ { "webresourceid": "…", "content": "dmFyIEZvcm0gPSB7…" } ] }
+      const existing = await provision.queryRecords('webresource', { select: ['webresourceid', 'content'], filter: `name eq '${odataLit(wr.name)}'`, top: 1 });
       if (existing && existing[0] && existing[0].webresourceid) {
         result.created.webResources[wr.name] = existing[0].webresourceid;
-        runner.skip('web-resources', `web resource ${wr.name} (exists — reuse)`);
+        const compared = wr.external === true ? null : webResourceContentState(wr, opts.appDir, existing[0].content);
+        if (compared && compared.state === 'differs') {
+          runner.skip('web-resources', `web resource ${wr.name} (exists — reuse; its deployed content differs from the spec's: content edits aren't applied on rebuild, recreate to change)`);
+          if (typeof opts.warn === 'function') {
+            opts.warn(`web resource ${wr.name}: its deployed content differs from the spec's and is left as it is — a rebuild does not write the content of a web resource that exists; delete it (or tear the app down) and build again to deploy the spec's content`);
+          }
+        } else if (compared && compared.state === 'unknown') {
+          runner.skip('web-resources', `web resource ${wr.name} (exists — reuse; its content was not compared: ${compared.reason})`);
+        } else {
+          runner.skip('web-resources', `web resource ${wr.name} (exists — reuse)`);
+        }
         continue;
       }
       await runner.run('web-resources', `web resource ${wr.name} (${wr.type || 'js'})`, async () => {
@@ -7123,6 +7162,41 @@ async function runSdkBuildPhases(spec, opts, owed) {
       // After the whole scan, so a build that halts on a later page says only why it halted. Nothing has been written yet, and the pages that are warned about are sent as they are.
       if (typeof opts.warn === 'function') for (const warning of griffelWarnings) opts.warn(warning);
 
+      // THE SOLUTION HOLDS THE PAGES TOO (AB#6443257). Every other component the build makes joins the spec's solution, but a page joins one only when it is added
+      // explicitly — the add of the app brings its sitemap, never the pages its navigation opens (lib/page-solution.js) — so a build made "in" a solution left
+      // its pages out of it, and the solution exported an app whose navigation opens pages the target environment does not have. A page this run CREATES is
+      // added as soon as it is made; one it UPDATES is re-asserted, as every component the build reuses is (lib/solution-membership.js): a page an earlier build
+      // made outside the solution, or whose add failed, joins it now, and one the solution is proven to hold costs a read and no write. A page the run KEEPS without
+      // writing it — a changed-only run leaves the pages it did not select as they are — is re-asserted the same way once the pages are written (the page manifest
+      // step, below). The add brings the page's file rows with it (AddRequiredComponents). The page table's component type is the environment's: read HERE, before
+      // the first page is written, so an environment that cannot say it halts the phase with nothing in it written. A system solution holds every component already
+      // and is not added to.
+      const pagesJoinSolution = !!(sol && sol.uniqueName) && !isRestrictedSolution(sol.uniqueName) && implemented.some(uploadedThisRun)
+        // An SDK with no raw client to read with is a test double, as everywhere in this file: the real one always has it, so there is no type to read and no page is added.
+        && !!(provision.dataverse && typeof provision.dataverse.get === 'function');
+      let pageComponentType = null;
+      let pageMembers = null;
+      const pagesInSolution = new Set();
+      if (pagesJoinSolution) {
+        try {
+          pageComponentType = await readPageComponentType(provision.dataverse);
+        } catch (e) {
+          throw new BuildHalt(`could not read the solution component type of a generative page, so the pages cannot join solution ${sol.uniqueName} — nothing in the pages phase was written: ${(e && e.message) || e}`, { phase: 'pages', code: 'pages-solution-type-unreadable', recoverable: true, ...retryFrom(e) });
+        }
+        pageMembers = createSolutionMembership({ read: provision, solutionUniqueName: sol.uniqueName, componentTypes: [pageComponentType] });
+      }
+      // `created`: a page this run has just made cannot already be a member, so it is added without the membership read.
+      const pageIntoSolution = async (pageId, { created }) => {
+        if (!pagesJoinSolution) return;
+        const id = String(pageId).toLowerCase();
+        if (pagesInSolution.has(id)) return;
+        if (created || !(await pageMembers.has(id, pageComponentType))) {
+          await provision.addSolutionComponent(pageComponent(id, pageComponentType, sol.uniqueName));
+          pageMembers.note(id, pageComponentType);
+        }
+        pagesInSolution.add(id);
+      };
+
       const mintedKeys = new Set();
       const deployment = new Map(); // key -> resolved code (nav sources only)
       // What a page write answered. The SDK's warnings, and a publish it could not prove, go to the build's log; a page that was SAVED but could not be
@@ -7264,6 +7338,7 @@ async function runSdkBuildPhases(spec, opts, owed) {
             mintedKeys.add(key);
             await persistNow();
             await afterWrite(p, 'created', up, fields);
+            await pageIntoSolution(up.pageId, { created: true });
           }
           const navSources = new Map();
           for (const p of implemented) if ((p.navigatesTo || []).length) navSources.set(keyOf(p), { code: sourceByKey.get(keyOf(p)) });
@@ -7374,6 +7449,7 @@ async function runSdkBuildPhases(spec, opts, owed) {
             result.created.pageSourceShas[key] = scannedSha.get(key);
             await persistNow(); // manifest carries this id BEFORE the next create (crash-safety, design §9)
             await afterWrite(p, requestedId ? 'updated' : 'created', up, fields);
+            await pageIntoSolution(up.pageId, { created: !requestedId });
             return up.pageId;
           });
         }
@@ -7385,8 +7461,18 @@ async function runSdkBuildPhases(spec, opts, owed) {
       //     (removal-only / detach) run — there is no page identity to record, and writing an empty manifest
       //     would needlessly create/update the web resource. The scan/create/upload steps above are already
       //     no-ops when spec.pages is empty (they iterate over spec.pages / implemented).
+      //     The solution holds every page the manifest binds, not only the pages this run wrote (AB#6443257). A changed-only run writes the pages it selected
+      //     and leaves the rest as they are — their content is the maker's to keep — but not out of the solution: a navigation target an earlier attempt of the
+      //     run made, and whose add was refused or never sent, is bound by its creation receipt now and not written again, so nothing else would add it, and the
+      //     build's retry, which keeps the selection, would succeed with that page outside the solution. Each such page is asserted as a page the run updates is
+      //     (pageIntoSolution): the one read of the solution's pages answers all of them, and only a page the solution is not proven to hold is added, as a full
+      //     build adds it. A page this run wrote was asserted then, and costs nothing here; a run that writes no page asserts none.
       if ((spec.pages || []).length) {
-        await runner.run('pages', `page manifest ${manifestResourceName(appUnique)}`, async () => { await persistNow(); return manifestResourceName(appUnique); });
+        await runner.run('pages', `page manifest ${manifestResourceName(appUnique)}`, async () => {
+          await persistNow();
+          for (const p of implemented) if (keyToId.has(keyOf(p))) await pageIntoSolution(keyToId.get(keyOf(p)), { created: false });
+          return manifestResourceName(appUnique);
+        });
       }
       // (6) Finalize the sitemap (the true commit point — only after all resolved uploads succeed). For a
       //     page-backed app this writes the resolved GenPage SubAreas. For an EXISTING app the app-shell
@@ -8252,4 +8338,4 @@ async function runSdkBuildPhases(spec, opts, owed) {
   return result;
 }
 
-module.exports = { runSdkBuild, publishTargets, partialEnrichment, settleOwedPublishes, collectOwedPublishes, settleOwedLengths, normalizeFormId, planFor, annotateLivePlan, resolvePhases, PHASES, BuildHalt, SDK_COLUMN_TYPE, viewDef, defaultViewColumns, subgridLabel, enrichesDefaultViews, dashboardsInSolution, findDashboardsByName, findPinnedDashboard, artifactIdentityQuery, resolveExistingFormId, FORM_TYPE_CODE, chartDef, dashboardTileOpts, dashboardComponent, compileFormIntent, formFieldLogicals, appDef, appUniqueName, applyAppAiDescription, haltOnUnpublishedAppHeader, pushAppHeader, commandsByEntity, commandDef, businessRuleDef, businessRuleFilter, bpfDef, bpfFilter, webResourceOpts, WEB_RESOURCE_KINDS, FORM_EVENTS, acquireAppPagesLease, personaRoleSpecFor, resolveRoleBusinessUnit, roleBuClause, roleGrantLabel, resolveRoleGrantTarget, existingAppSitemapIsWritten, pagesFirstRule, applyAppHeader, applyAppHeaderText, warnAppIconNotApplied, inspectBpfStages, applyBpfStages, refuseUnpushedAppCopy, assertAuthorizedSitemapRewrite, reconciledPublishHalt };
+module.exports = { runSdkBuild, publishTargets, partialEnrichment, settleOwedPublishes, collectOwedPublishes, settleOwedLengths, normalizeFormId, planFor, annotateLivePlan, resolvePhases, PHASES, BuildHalt, SDK_COLUMN_TYPE, viewDef, defaultViewColumns, subgridLabel, enrichesDefaultViews, dashboardsInSolution, findDashboardsByName, findPinnedDashboard, artifactIdentityQuery, resolveExistingFormId, FORM_TYPE_CODE, chartDef, dashboardTileOpts, dashboardComponent, compileFormIntent, formFieldLogicals, appDef, appUniqueName, applyAppAiDescription, haltOnUnpublishedAppHeader, pushAppHeader, commandsByEntity, commandDef, businessRuleDef, businessRuleFilter, bpfDef, bpfFilter, webResourceOpts, webResourceContentState, WEB_RESOURCE_KINDS, FORM_EVENTS, acquireAppPagesLease, personaRoleSpecFor, resolveRoleBusinessUnit, roleBuClause, roleGrantLabel, resolveRoleGrantTarget, existingAppSitemapIsWritten, pagesFirstRule, applyAppHeader, applyAppHeaderText, warnAppIconNotApplied, inspectBpfStages, applyBpfStages, refuseUnpushedAppCopy, assertAuthorizedSitemapRewrite, reconciledPublishHalt };
